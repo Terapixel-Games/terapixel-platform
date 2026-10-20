@@ -13,3 +13,4 @@ export {
   createRuntimeConfigProvider,
   createNoopRuntimeConfigProvider
 } from "./src/platformRuntimeConfigProvider.js";
+export { withPostgresTransaction } from "./src/postgresTransaction.js";

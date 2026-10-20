@@ -123,3 +123,38 @@ legacy mutator. No merge selection/entitlement rules are changed. Memory and
 PostgreSQL merge concurrency, cross-process file locking and fsync durability
 remain outside this follow-up. Real PostgreSQL integration remains unexecuted
 and is a release gate, not a passing test.
+## PostgreSQL profile-merge transaction ownership
+
+The PostgreSQL store now pins profile merging to one checked-out client, including
+subscription reads/writes. A SHARE ROW EXCLUSIVE lock on `iap_coin_balances` and
+`iap_subscriptions` serializes merge writers and ordinary INSERT/UPDATE/DELETE
+operations during the local transfer, including legacy writers without advisory
+lock cooperation. This prevents two overlapping merges from copying the same
+secondary balance or a wallet writer changing rows between copying and zeroing.
+Subscription choice and `{ merged: true|false }` response semantics are unchanged.
+Errors roll back the complete transfer and release the client; rollback failure
+discards the connection without replacing the original error.
+
+The table-wide locks are deliberately conservative and can delay grants/debits
+for other profiles while a merge runs. There are no remote calls inside the
+transaction. Validate this latency/locking tradeoff and the runtime DB role's
+ability to take these locks before release; no permissions/configuration are
+changed here. No schema migration is required.
+
+This patch uses original main baseline `bfa6290`, without a wallet or billing
+branch dependency. Its subscription-write helper extraction mirrors the wallet
+atomicity patch, so integration should retain both the atomic wallet operation
+and pinned merge helpers. This branch alone does not contain the earlier wallet
+atomicity fix. All approved fixes still require review/integration into main
+before staging and production.
+
+A grant made to the secondary profile after merge commit stays on that profile;
+this patch does not redirect late writes or implement durable merge jobs. The
+cross-service coordinator, idempotent saga/reconciliation, memory-store merge
+concurrency and JSON file-store follow-up are separate changes. Existing
+subscription/provider/webhook behavior is unchanged.
+
+`test/postgres-consumption.test.js` checks pinned SQL and injected failures using
+scripted clients. Optional real local DB tests and installed-tool availability
+are documented in the identity-gateway README. Real PostgreSQL concurrency,
+rollback and lock behavior have not been executed here and remain a release gate.

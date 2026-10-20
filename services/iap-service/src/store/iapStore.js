@@ -125,44 +125,21 @@ export class JsonFileIapStore extends InMemoryIapStore {
   }
 
   async applyTransaction(provider, externalTransactionId, record, effect = {}) {
-    const operation = this._writeQueue.then(async () => {
-      await this._ensureLoaded();
-      const staged = new InMemoryIapStore();
-      staged._coinBalances = new Map(this._coinBalances);
-      staged._subscriptions = new Map(this._subscriptions);
-      staged._transactions = new Map(this._transactions);
-      const result = await staged.applyTransaction(provider, externalTransactionId, record, effect);
-      if (result.isNew) {
-        await this._writeSnapshot(staged);
-        this._coinBalances = staged._coinBalances;
-        this._subscriptions = staged._subscriptions;
-        this._transactions = staged._transactions;
-      }
-      return result;
-    });
-    // A failed write must not poison retries or consume an idempotency key.
-    this._writeQueue = operation.catch(() => {});
-    return operation;
+    return this._mutate(
+      (staged) => staged.applyTransaction(provider, externalTransactionId, record, effect),
+      (result) => result.isNew
+    );
   }
 
   async recordTransaction(provider, externalTransactionId, record) {
-    await this._ensureLoaded();
-    const result = await super.recordTransaction(
-      provider,
-      externalTransactionId,
-      record
+    return this._mutate(
+      (staged) => staged.recordTransaction(provider, externalTransactionId, record),
+      (result) => result.isNew
     );
-    if (result.isNew) {
-      await this._enqueueWrite();
-    }
-    return result;
   }
 
   async addCoins(profileId, gameId, delta) {
-    await this._ensureLoaded();
-    const result = await super.addCoins(profileId, gameId, delta);
-    await this._enqueueWrite();
-    return result;
+    return this._mutate((staged) => staged.addCoins(profileId, gameId, delta));
   }
 
   async getCoins(profileId) {
@@ -176,19 +153,38 @@ export class JsonFileIapStore extends InMemoryIapStore {
   }
 
   async upsertSubscription(profileId, subscription) {
-    await this._ensureLoaded();
-    const result = await super.upsertSubscription(profileId, subscription);
-    await this._enqueueWrite();
-    return result;
+    return this._mutate((staged) => staged.upsertSubscription(profileId, subscription));
   }
 
   async mergeProfiles(primaryProfileId, secondaryProfileId) {
-    await this._ensureLoaded();
-    const result = await super.mergeProfiles(primaryProfileId, secondaryProfileId);
-    if (result.merged) {
-      await this._enqueueWrite();
-    }
-    return result;
+    // Run the existing merge on the isolated in-memory stage. Its internal
+    // addCoins/upsertSubscription calls must not re-enter this file queue.
+    return this._mutate(
+      (staged) => staged.mergeProfiles(primaryProfileId, secondaryProfileId),
+      (result) => result.merged
+    );
+  }
+
+  async _mutate(mutation, shouldWrite = () => true) {
+    const operation = this._writeQueue.then(async () => {
+      await this._ensureLoaded();
+      const staged = new InMemoryIapStore();
+      staged._coinBalances = new Map(this._coinBalances);
+      staged._subscriptions = new Map(this._subscriptions);
+      staged._transactions = new Map(this._transactions);
+      const result = await mutation(staged);
+      if (shouldWrite(result)) {
+        await this._writeSnapshot(staged);
+        this._coinBalances = staged._coinBalances;
+        this._subscriptions = staged._subscriptions;
+        this._transactions = staged._transactions;
+      }
+      return result;
+    });
+    // All mutation paths stage before writing; a failure leaves committed state
+    // intact and cannot poison subsequent operations or consume success keys.
+    this._writeQueue = operation.catch(() => {});
+    return operation;
   }
 
   async _ensureLoaded() {
@@ -207,12 +203,6 @@ export class JsonFileIapStore extends InMemoryIapStore {
       });
     }
     await this._loadPromise;
-  }
-
-  async _enqueueWrite() {
-    const operation = this._writeQueue.then(() => this._writeSnapshot(this));
-    this._writeQueue = operation.catch(() => {});
-    await operation;
   }
 
   async _writeSnapshot(store) {

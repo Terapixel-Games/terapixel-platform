@@ -1,4 +1,5 @@
 export function createAppleProvider(options = {}) {
+  const fetchImpl = options.fetch || fetch;
   const sharedSecret = String(options.sharedSecret || "");
   const productionUrl =
     String(options.productionUrl || "").trim() ||
@@ -9,7 +10,8 @@ export function createAppleProvider(options = {}) {
 
   return {
     verifyPurchase: async ({ provider, productId, payload, catalogEntry, nowSeconds }) => {
-      const receiptData = String(payload?.receipt_data || payload?.receiptData || "").trim();
+      const rawReceipt = payload?.receipt_data || payload?.receiptData;
+      const receiptData = typeof rawReceipt === "string" ? rawReceipt.trim() : "";
       if (!receiptData) {
         throw new Error("apple payload.receipt_data is required");
       }
@@ -18,10 +20,10 @@ export function createAppleProvider(options = {}) {
         password: sharedSecret || undefined,
         "exclude-old-transactions": true
       };
-      let response = await postJson(productionUrl, requestBody);
+      let response = await postJson(productionUrl, requestBody, fetchImpl);
       // Apple status 21007 means sandbox receipt sent to production.
       if (Number(response?.status) === 21007) {
-        response = await postJson(sandboxUrl, requestBody);
+        response = await postJson(sandboxUrl, requestBody, fetchImpl);
       }
       if (Number(response?.status) !== 0) {
         throw new Error(`apple receipt rejected (status=${response?.status})`);
@@ -48,6 +50,9 @@ export function createAppleProvider(options = {}) {
         };
       }
       const expiresAt = Math.floor(Number(line.expires_date_ms || 0) / 1000);
+      if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
+        throw new Error("apple subscription missing valid expiry");
+      }
       const active = expiresAt > now;
       return {
         provider,
@@ -74,6 +79,10 @@ function pickAppleReceiptLine(response, productId) {
   const inApp = Array.isArray(response?.receipt?.in_app) ? response.receipt.in_app : [];
   const merged = [...latest, ...inApp];
   const target = String(productId || "").trim().toLowerCase();
+  merged.sort((a, b) =>
+    Number(b?.expires_date_ms || b?.purchase_date_ms || 0) -
+    Number(a?.expires_date_ms || a?.purchase_date_ms || 0)
+  );
   for (const row of merged) {
     if (!row || typeof row !== "object") {
       continue;
@@ -82,11 +91,11 @@ function pickAppleReceiptLine(response, productId) {
       return row;
     }
   }
-  return merged[0] || null;
+  return null;
 }
 
-async function postJson(url, body) {
-  const response = await fetch(url, {
+async function postJson(url, body, fetchImpl) {
+  const response = await fetchImpl(url, {
     method: "POST",
     headers: {
       "content-type": "application/json"

@@ -1,5 +1,6 @@
 import http from "node:http";
 import crypto from "node:crypto";
+import { PurchaseVerificationError, WebhookUnavailableError } from "./iapService.js";
 import {
   JwtValidationError,
   createSessionTokenVerifier
@@ -66,6 +67,12 @@ export function createIapHttpServer(options = {}) {
         requestId
       });
     } catch (error) {
+      if (error instanceof PurchaseVerificationError) {
+        error = new HttpError(422, "purchase_rejected", error.message);
+      }
+      if (error instanceof WebhookUnavailableError) {
+        error = new HttpError(503, "webhook_not_configured", error.message);
+      }
       if (error instanceof HttpError) {
         writeJson(res, error.statusCode, {
           request_id: requestId,
@@ -128,6 +135,11 @@ async function handleRequest(req, res, ctx) {
     }
     const body = await readJsonBody(req, ctx.bodyLimitBytes);
     ensureObjectBody(body);
+    if (typeof body.provider !== "string" || !body.provider.trim() ||
+        typeof body.product_id !== "string" || !body.product_id.trim()) {
+      throw new HttpError(400, "invalid_request", "provider and product_id are required");
+    }
+    ensureObjectBody(body.payload);
     const result = await ctx.service.verifyPurchase({
       profileId,
       provider: body.provider,
@@ -168,18 +180,8 @@ async function handleRequest(req, res, ctx) {
   if (req.method === "POST" && isWebhookPath(url.pathname)) {
     const body = await readJsonBody(req, ctx.bodyLimitBytes);
     ensureObjectBody(body);
-  const provider = webhookProviderFromPath(url.pathname);
-    await verifyWebhookSignatureStub(req, provider);
-    const result = await ctx.service.applyWebhookEvent({
-      provider,
-      body: {
-        ...body,
-        export_target:
-          body.export_target ||
-          req.headers["x-export-target"] ||
-          mapProviderToDefaultTarget(provider)
-      }
-    });
+    const provider = webhookProviderFromPath(url.pathname);
+    const result = await ctx.service.applyWebhookEvent({ provider, body });
     writeJson(res, 202, {
       request_id: ctx.requestId,
       ...result
@@ -284,20 +286,6 @@ function webhookProviderFromPath(pathname) {
     return "google";
   }
   return "paypal_web";
-}
-
-function mapProviderToDefaultTarget(provider) {
-  if (provider === "apple") {
-    return "ios";
-  }
-  if (provider === "google") {
-    return "android";
-  }
-  return "web";
-}
-
-async function verifyWebhookSignatureStub(_req, _provider) {
-  return true;
 }
 
 async function readJsonBody(req, bodyLimitBytes) {

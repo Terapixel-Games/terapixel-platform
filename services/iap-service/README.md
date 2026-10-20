@@ -55,3 +55,51 @@ Purpose: purchase verification and entitlement source of truth.
 - `poki` -> `paypal_web`
 - `crazygames` -> `paypal_web`
 - `web` -> `paypal_web`
+
+## Atomic purchase grants and wallet adjustments
+
+`verifyPurchase` and `adjustCoins` use the store contract
+`applyTransaction(provider, externalTransactionId, record, effect)`. `effect` is
+one coin delta (`{ coins: { gameId, delta } }`) or the existing normalized
+subscription value. The successful deduplication record and benefit are committed
+together; insufficient funds or a failed grant does not consume the success key.
+Concurrent duplicate transactions apply once. Distinct concurrent spends use a
+conditional debit and cannot spend more than the available wallet balance.
+Integer deltas/balances use the existing PostgreSQL signed INT range.
+
+PostgreSQL uses `pool.connect()` and one pinned client for BEGIN, dedupe INSERT,
+conditional wallet UPDATE (or existing subscription write), and COMMIT. Errors
+ROLLBACK before releasing; rollback failures discard the connection and preserve
+the original error. A response/connection failure around COMMIT can leave the
+caller uncertain about success; retry with the same key rather than a new key.
+The committed record prevents a repeated grant after a successful commit.
+No schema migration is required. Historical records that were already saved
+without a matching grant are not repaired automatically by this patch.
+
+The memory implementation publishes each operation without asynchronous gaps.
+The JSON file implementation serializes these transactions, writes a staged
+snapshot using the existing temporary-file/rename pattern, then publishes the
+in-memory state. A failed snapshot write leaves the operation retryable. File
+mode is single-instance/single-writer only; it provides no cross-process locking
+or fsync-based power-loss durability. Legacy standalone store mutators remain
+for existing setup/merge paths; do not compose them for purchase/wallet writes.
+Concurrent profile merges versus wallet operations are outside this patch and
+have not been made transactionally safe. Subscription/provider/webhook behavior
+and save/merge implementations are otherwise unchanged.
+
+Validation:
+
+- `node --test test/iap-atomicity.test.js test/postgres-iap-atomicity.test.js`:
+  memory/file concurrency, fault and retry coverage plus scripted PostgreSQL
+  pinned-client/rollback tests. The latter mocks SQL responses and does not prove
+  real PostgreSQL lock behavior.
+- `test/postgres-iap-integration.test.js` is an opt-in real PostgreSQL test. With
+  dependencies installed and an already-running disposable local database,
+  supply `IAP_TEST_LOCAL_DATABASE_URL` pointing only to loopback, with no URL query
+  parameters, and run `node --test test/postgres-iap-integration.test.js`.
+  It creates/drops an isolated schema, injects a grant failure with a database
+  trigger, and tests concurrent duplicate grants/spends and funded retries.
+  It never reads `DATABASE_URL` and is skipped unless explicitly configured.
+
+No database/server, credentials, or live settings are provisioned by these changes.
+Review and merge this independent patch to main before staging or production.

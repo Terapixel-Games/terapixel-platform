@@ -83,8 +83,9 @@ in-memory state. A failed snapshot write leaves the operation retryable. File
 mode is single-instance/single-writer only; it provides no cross-process locking
 or fsync-based power-loss durability. Legacy standalone store mutators remain
 for existing setup/merge paths; do not compose them for purchase/wallet writes.
-Concurrent profile merges versus wallet operations are outside this patch and
-have not been made transactionally safe. Subscription/provider/webhook behavior
+The file-store follow-up below serializes all mutations, including the existing
+merge operation. PostgreSQL/memory profile merges versus wallet operations remain
+outside this patch and have not been made transactionally safe. Subscription/provider/webhook behavior
 and save/merge implementations are otherwise unchanged.
 
 Validation:
@@ -103,3 +104,22 @@ Validation:
 
 No database/server, credentials, or live settings are provisioned by these changes.
 Review and merge this independent patch to main before staging or production.
+
+
+### File-store serialization follow-up
+
+All JSON file-store mutations now share one staged queue: `applyTransaction`,
+legacy `recordTransaction`, `addCoins`, `upsertSubscription` and `mergeProfiles`.
+Reads observe the previous committed snapshot while a write is pending. Failure
+leaves both live state and the prior file unchanged, and later operations can
+retry. The existing merge runs on the isolated in-memory stage, so its internal
+helper calls do not recursively enter the file queue or expose partial state.
+
+This corrects a reproducible lost update: a staged debit of 40 from 100 followed
+by an overlapping legacy credit of 10 previously published 60; it now persists
+70, including after reload. Regression tests also cover queued transaction and
+subscription writes, overlapping merges, and snapshot failures/retries for every
+legacy mutator. No merge selection/entitlement rules are changed. Memory and
+PostgreSQL merge concurrency, cross-process file locking and fsync durability
+remain outside this follow-up. Real PostgreSQL integration remains unexecuted
+and is a release gate, not a passing test.

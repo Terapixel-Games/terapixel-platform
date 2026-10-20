@@ -1,5 +1,6 @@
 import http from "node:http";
 import crypto from "node:crypto";
+import { SaveConflictError, SaveValidationError } from "./saveErrors.js";
 import {
   JwtValidationError,
   createSessionTokenVerifier
@@ -70,6 +71,11 @@ export function createSaveHttpServer(options = {}) {
         requestId
       });
     } catch (error) {
+      if (error instanceof SaveConflictError) {
+        writeJson(res, 409, { request_id: requestId, error: { code: "save_conflict", message: error.message }, envelope: error.envelope, retryable: true });
+        return;
+      }
+      if (error instanceof SaveValidationError) error = new HttpError(422, "invalid_request", error.message);
       if (error instanceof HttpError) {
         writeJson(res, error.statusCode, {
           request_id: requestId,
@@ -135,22 +141,14 @@ async function handleRequest(req, res, ctx) {
       throw new HttpError(400, "invalid_request", "game_id is required");
     }
 
-    const clientEnvelope =
-      body.client_envelope && typeof body.client_envelope === "object"
-        ? body.client_envelope
-        : null;
+    const clientEnvelope = body.client_envelope ?? null;
 
-    let result;
-    try {
-      result = await ctx.service.syncSave({
-        gameId,
-        profileId,
-        clientEnvelope,
-        nowSeconds: body.now_seconds
-      });
-    } catch (error) {
-      throw new HttpError(422, "invalid_request", error.message);
-    }
+    const result = await ctx.service.syncSave({
+      gameId,
+      profileId,
+      clientEnvelope,
+      nowSeconds: body.now_seconds
+    });
 
     writeJson(res, 200, {
       request_id: ctx.requestId,

@@ -1,3 +1,5 @@
+import { SaveValidationError } from "./saveErrors.js";
+
 export const SAVE_ENVELOPE_SCHEMA_VERSION = 1;
 
 const DEFAULT_PAYLOAD = Object.freeze({
@@ -19,7 +21,7 @@ export function createDefaultSaveEnvelope(input = {}) {
     schema_version: SAVE_ENVELOPE_SCHEMA_VERSION,
     game_id: String(input.gameId || ""),
     profile_id: String(input.profileId || ""),
-    revision: normalizeInt(input.revision, 1),
+    revision: input.revision === undefined ? 1 : input.revision,
     updated_at: now,
     payload
   };
@@ -28,26 +30,26 @@ export function createDefaultSaveEnvelope(input = {}) {
 }
 
 export function validateSaveEnvelope(envelope) {
-  if (!envelope || typeof envelope !== "object") {
-    throw new Error("save envelope must be an object");
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
+    throw new SaveValidationError("save envelope must be an object");
   }
-  if (normalizeInt(envelope.schema_version, -1) < 1) {
-    throw new Error("save envelope schema_version must be >= 1");
+  if (!Number.isSafeInteger(envelope.schema_version) || envelope.schema_version < 1) {
+    throw new SaveValidationError("save envelope schema_version must be a positive safe integer");
   }
   if (!envelope.game_id || typeof envelope.game_id !== "string") {
-    throw new Error("save envelope game_id is required");
+    throw new SaveValidationError("save envelope game_id is required");
   }
   if (!envelope.profile_id || typeof envelope.profile_id !== "string") {
-    throw new Error("save envelope profile_id is required");
+    throw new SaveValidationError("save envelope profile_id is required");
   }
-  if (normalizeInt(envelope.revision, -1) < 1) {
-    throw new Error("save envelope revision must be >= 1");
+  if (!Number.isSafeInteger(envelope.revision) || envelope.revision < 1) {
+    throw new SaveValidationError("save envelope revision must be a positive safe integer");
   }
-  if (normalizeUnix(envelope.updated_at) <= 0) {
-    throw new Error("save envelope updated_at must be > 0");
+  if (!Number.isSafeInteger(envelope.updated_at) || envelope.updated_at <= 0) {
+    throw new SaveValidationError("save envelope updated_at must be > 0");
   }
-  if (!envelope.payload || typeof envelope.payload !== "object") {
-    throw new Error("save envelope payload must be an object");
+  if (!envelope.payload || typeof envelope.payload !== "object" || Array.isArray(envelope.payload)) {
+    throw new SaveValidationError("save envelope payload must be an object");
   }
   return envelope;
 }
@@ -57,10 +59,10 @@ export function mergeSaveEnvelopes(localEnvelope, remoteEnvelope, options = {}) 
   validateSaveEnvelope(remoteEnvelope);
 
   if (localEnvelope.game_id !== remoteEnvelope.game_id) {
-    throw new Error("cannot merge envelopes with different game_id");
+    throw new SaveValidationError("cannot merge envelopes with different game_id");
   }
   if (localEnvelope.profile_id !== remoteEnvelope.profile_id) {
-    throw new Error("cannot merge envelopes with different profile_id");
+    throw new SaveValidationError("cannot merge envelopes with different profile_id");
   }
 
   const fresher = pickFresherEnvelope(localEnvelope, remoteEnvelope);
@@ -69,7 +71,7 @@ export function mergeSaveEnvelopes(localEnvelope, remoteEnvelope, options = {}) 
   const mergedPayload = mergePayload(fresher.payload, older.payload);
   const now = normalizeUnix(options.nowSeconds || Math.floor(Date.now() / 1000));
 
-  return {
+  return validateSaveEnvelope({
     schema_version: Math.max(
       normalizeInt(localEnvelope.schema_version, 1),
       normalizeInt(remoteEnvelope.schema_version, 1)
@@ -83,7 +85,7 @@ export function mergeSaveEnvelopes(localEnvelope, remoteEnvelope, options = {}) 
       ) + 1,
     updated_at: Math.max(now, fresher.updated_at, older.updated_at),
     payload: mergedPayload
-  };
+  });
 }
 
 function pickFresherEnvelope(a, b) {

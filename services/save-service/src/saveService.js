@@ -3,11 +3,15 @@ import {
   mergeSaveEnvelopes,
   validateSaveEnvelope
 } from "./saveEnvelope.js";
+import { SaveConflictError, SaveValidationError } from "./saveErrors.js";
 import { InMemorySaveStore } from "./saveStore.js";
 import { createNoopRuntimeConfigProvider } from "../../../packages/shared-utils/index.js";
 
 export function createSaveService(options = {}) {
   const saveStore = options.saveStore || new InMemorySaveStore();
+  if (typeof saveStore.compareAndSwap !== "function") throw new Error("saveStore.compareAndSwap is required");
+  const maxWriteAttempts = options.maxWriteAttempts ?? 5;
+  if (!Number.isInteger(maxWriteAttempts) || maxWriteAttempts < 1 || maxWriteAttempts > 20) throw new Error("maxWriteAttempts must be between 1 and 20");
   const runtimeConfigProvider =
     options.runtimeConfigProvider || createNoopRuntimeConfigProvider();
   const runtimeConfigRequired = options.runtimeConfigRequired === true;
@@ -22,7 +26,7 @@ export function createSaveService(options = {}) {
         runtimeConfigProvider,
         runtimeConfigRequired
       });
-      return saveStore.get(gameId, profileId);
+      return readServerEnvelope(saveStore, gameId, profileId);
     },
     syncSave: async ({ gameId, profileId, clientEnvelope, nowSeconds }) => {
       assertRequiredString(gameId, "gameId");
@@ -34,53 +38,26 @@ export function createSaveService(options = {}) {
       });
       const now = normalizeNow(nowSeconds);
 
-      const serverEnvelope = await saveStore.get(gameId, profileId);
-      if (!clientEnvelope && serverEnvelope) {
-        return {
-          envelope: serverEnvelope,
-          source: "server"
-        };
-      }
-
-      if (!clientEnvelope && !serverEnvelope) {
-        const created = createDefaultSaveEnvelope({
-          gameId,
-          profileId,
-          updatedAt: now
-        });
-        const persisted = await saveStore.put(created);
-        return {
-          envelope: persisted,
-          source: "created_default"
-        };
-      }
-
-      if (clientEnvelope) {
+      const hasClient = clientEnvelope !== null && clientEnvelope !== undefined;
+      if (hasClient) {
         validateSaveEnvelope(clientEnvelope);
         assertEnvelopeIdentity(clientEnvelope, gameId, profileId);
       }
-
-      if (!serverEnvelope && clientEnvelope) {
-        const firstWrite = {
-          ...clientEnvelope,
-          updated_at: Math.max(Number(clientEnvelope.updated_at) || 0, now),
-          revision: Math.max(1, Number(clientEnvelope.revision) || 1)
-        };
-        const persisted = await saveStore.put(firstWrite);
-        return {
-          envelope: persisted,
-          source: "client_first_write"
-        };
+      for (let attempt = 0; attempt < maxWriteAttempts; attempt++) {
+        const server = await readServerEnvelope(saveStore, gameId, profileId);
+        if (!hasClient && server) return { envelope: server, source: "server" };
+        const source = server ? "merged" : hasClient ? "client_first_write" : "created_default";
+        const candidate = server
+          ? mergeSaveEnvelopes(clientEnvelope, server, { nowSeconds: now })
+          : hasClient
+            ? { ...clientEnvelope, updated_at: Math.max(clientEnvelope.updated_at, now) }
+            : createDefaultSaveEnvelope({ gameId, profileId, updatedAt: now });
+        const result = await saveStore.compareAndSwap(candidate, server?.revision ?? null, server);
+        if (result.applied) return { envelope: result.envelope, source };
+        // Read again and remerge the ORIGINAL client envelope, never overwrite
+        // the winner using a candidate calculated from a stale snapshot.
       }
-
-      const merged = mergeSaveEnvelopes(clientEnvelope, serverEnvelope, {
-        nowSeconds: now
-      });
-      const persisted = await saveStore.put(merged);
-      return {
-        envelope: persisted,
-        source: "merged"
-      };
+      throw new SaveConflictError(await readServerEnvelope(saveStore, gameId, profileId));
     },
     mergeProfiles: async ({ primaryProfileId, secondaryProfileId, nowSeconds }) => {
       assertRequiredString(primaryProfileId, "primaryProfileId");
@@ -89,30 +66,24 @@ export function createSaveService(options = {}) {
         return { merged: false, affected_games: [] };
       }
       const now = normalizeNow(nowSeconds);
-      const secondaryRows = await listByProfile(saveStore, secondaryProfileId);
+      if (typeof saveStore.listByProfile !== "function" || typeof saveStore.migrateProfileGame !== "function") {
+        throw new Error("save store must support atomic per-game profile migration");
+      }
+      const secondaryRows = await saveStore.listByProfile(secondaryProfileId);
       const affectedGames = [];
-      for (const secondaryEnvelope of secondaryRows) {
-        const gameId = String(secondaryEnvelope.game_id || "");
-        if (!gameId) {
-          continue;
+      for (const gameId of new Set(secondaryRows.map((row) => row.game_id))) {
+        let finished = false;
+        for (let attempt = 0; attempt < maxWriteAttempts; attempt++) {
+          try {
+            const result = await saveStore.migrateProfileGame(gameId, primaryProfileId, secondaryProfileId, now);
+            if (result.migrated) affectedGames.push(gameId);
+            finished = true;
+            break;
+          } catch (error) {
+            if (!(error instanceof SaveConflictError)) throw error;
+          }
         }
-        const primaryEnvelope = await saveStore.get(gameId, primaryProfileId);
-        const secondaryAsPrimary = {
-          ...secondaryEnvelope,
-          profile_id: primaryProfileId
-        };
-        const merged = primaryEnvelope
-          ? mergeSaveEnvelopes(secondaryAsPrimary, primaryEnvelope, {
-              nowSeconds: now
-            })
-          : {
-              ...secondaryAsPrimary,
-              revision: Math.max(1, Number(secondaryAsPrimary.revision) || 1),
-              updated_at: Math.max(now, Number(secondaryAsPrimary.updated_at) || 0)
-            };
-        await saveStore.put(merged);
-        await deleteByGameAndProfile(saveStore, gameId, secondaryProfileId);
-        affectedGames.push(gameId);
+        if (!finished) throw new SaveConflictError(await readServerEnvelope(saveStore, gameId, primaryProfileId));
       }
       return {
         merged: true,
@@ -130,13 +101,13 @@ async function assertGameConfigured(input = {}) {
     gameId: input.gameId
   });
   if (!runtimeConfig) {
-    throw new Error("game_id is not onboarded or is inactive");
+    throw new SaveValidationError("game_id is not onboarded or is inactive");
   }
 }
 
 function assertRequiredString(value, fieldName) {
   if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`${fieldName} is required`);
+    throw new SaveValidationError(`${fieldName} is required`);
   }
 }
 
@@ -149,22 +120,18 @@ function normalizeNow(nowSeconds) {
 
 function assertEnvelopeIdentity(envelope, gameId, profileId) {
   if (envelope.game_id !== gameId) {
-    throw new Error("client envelope game_id mismatch");
+    throw new SaveValidationError("client envelope game_id mismatch");
   }
   if (envelope.profile_id !== profileId) {
-    throw new Error("client envelope profile_id mismatch");
+    throw new SaveValidationError("client envelope profile_id mismatch");
   }
 }
 
-async function listByProfile(saveStore, profileId) {
-  if (typeof saveStore.listByProfile === "function") {
-    return saveStore.listByProfile(profileId);
+async function readServerEnvelope(store, gameId, profileId) {
+  const envelope = await store.get(gameId, profileId);
+  if (envelope) {
+    validateSaveEnvelope(envelope);
+    assertEnvelopeIdentity(envelope, gameId, profileId);
   }
-  return [];
-}
-
-async function deleteByGameAndProfile(saveStore, gameId, profileId) {
-  if (typeof saveStore.deleteByGameAndProfile === "function") {
-    await saveStore.deleteByGameAndProfile(gameId, profileId);
-  }
+  return envelope;
 }

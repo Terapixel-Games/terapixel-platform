@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 export function createGooglePlayProvider(options = {}) {
+  const fetchImpl = options.fetch || fetch;
   const clientEmail = String(options.clientEmail || "");
   const privateKey = normalizePrivateKey(options.privateKey || "");
   const tokenUrl =
@@ -12,10 +13,10 @@ export function createGooglePlayProvider(options = {}) {
 
   return {
     verifyPurchase: async ({ provider, productId, payload, catalogEntry, nowSeconds }) => {
-      const packageName = String(payload?.package_name || payload?.packageName || "").trim();
-      const purchaseToken = String(
-        payload?.purchase_token || payload?.purchaseToken || ""
-      ).trim();
+      const rawPackage = payload?.package_name || payload?.packageName;
+      const rawToken = payload?.purchase_token || payload?.purchaseToken;
+      const packageName = typeof rawPackage === "string" ? rawPackage.trim() : "";
+      const purchaseToken = typeof rawToken === "string" ? rawToken.trim() : "";
       if (!packageName || !purchaseToken) {
         throw new Error("google payload.package_name and payload.purchase_token are required");
       }
@@ -26,7 +27,8 @@ export function createGooglePlayProvider(options = {}) {
         clientEmail,
         privateKey,
         tokenUrl,
-        scope
+        scope,
+        fetchImpl
       });
 
       if (catalogEntry.type === "consumable") {
@@ -35,8 +37,8 @@ export function createGooglePlayProvider(options = {}) {
         )}/purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(
           purchaseToken
         )}`;
-        const purchase = await getJson(url, accessToken);
-        const state = Number(purchase.purchaseState || 0);
+        const purchase = await getJson(url, accessToken, fetchImpl);
+        const state = purchase.purchaseState;
         if (state !== 0) {
           throw new Error(`google purchase not completed (purchaseState=${state})`);
         }
@@ -55,12 +57,23 @@ export function createGooglePlayProvider(options = {}) {
       const url = `${apiBase}/${encodeURIComponent(
         packageName
       )}/purchases/subscriptionsv2/tokens/${encodeURIComponent(purchaseToken)}`;
-      const sub = await getJson(url, accessToken);
-      const latestLine = Array.isArray(sub.lineItems) ? sub.lineItems[0] || {} : {};
+      const sub = await getJson(url, accessToken, fetchImpl);
+      const lines = Array.isArray(sub.lineItems)
+        ? sub.lineItems.filter((line) => line?.productId === productId)
+        : [];
+      lines.sort((a, b) => Date.parse(b.expiryTime) - Date.parse(a.expiryTime));
+      const latestLine = lines[0];
+      if (!latestLine) throw new Error("google subscription missing matching product");
       const expiry = Date.parse(String(latestLine.expiryTime || ""));
       const expiresAt = Number.isFinite(expiry) ? Math.floor(expiry / 1000) : 0;
+      if (expiresAt <= 0) throw new Error("google subscription missing valid expiry");
       const now = normalizeNow(nowSeconds);
-      const active = expiresAt > now;
+      const state = String(sub.subscriptionState || "");
+      if (!state || state === "SUBSCRIPTION_STATE_UNSPECIFIED") {
+        throw new Error("google subscription missing state");
+      }
+      const entitledStates = ["SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD", "SUBSCRIPTION_STATE_CANCELED"];
+      const active = entitledStates.includes(state) && expiresAt > now;
       return {
         provider,
         externalTransactionId: String(
@@ -72,7 +85,7 @@ export function createGooglePlayProvider(options = {}) {
         subscription: {
           provider,
           externalSubscriptionId: String(sub.latestOrderId || purchaseToken),
-          status: active ? "active" : "expired",
+          status: expiresAt <= now ? "expired" : state.replace("SUBSCRIPTION_STATE_", "").toLowerCase(),
           active,
           expiresAt: expiresAt > 0 ? expiresAt : undefined
         }
@@ -94,7 +107,7 @@ async function createGoogleAccessToken(config) {
     grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
     assertion
   });
-  const response = await fetch(config.tokenUrl, {
+  const response = await config.fetchImpl(config.tokenUrl, {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded"
@@ -129,8 +142,8 @@ function signServiceAccountJwt(input) {
   return `${unsigned}.${base64UrlBuffer(signature)}`;
 }
 
-async function getJson(url, accessToken) {
-  const response = await fetch(url, {
+async function getJson(url, accessToken, fetchImpl) {
+  const response = await fetchImpl(url, {
     method: "GET",
     headers: {
       authorization: `Bearer ${accessToken}`

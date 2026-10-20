@@ -1,12 +1,17 @@
 export function createPaypalWebProvider(options = {}) {
+  const fetchImpl = options.fetch || fetch;
   const defaultClientId = String(options.clientId || "");
   const defaultClientSecret = String(options.clientSecret || "");
   const defaultBaseUrl =
     String(options.baseUrl || "").trim() || "https://api-m.paypal.com";
 
   return {
-    verifyPurchase: async ({ provider, payload, catalogEntry, nowSeconds, providerConfig }) => {
-      const orderId = String(payload?.order_id || payload?.orderId || "").trim();
+    verifyPurchase: async ({ provider, payload, catalogEntry, providerConfig }) => {
+      if (catalogEntry?.type !== "consumable") {
+        throw new Error("PayPal subscription verification is not supported");
+      }
+      const rawOrderId = payload?.order_id || payload?.orderId;
+      const orderId = typeof rawOrderId === "string" ? rawOrderId.trim() : "";
       if (!orderId) {
         throw new Error("paypal payload.order_id is required");
       }
@@ -23,76 +28,62 @@ export function createPaypalWebProvider(options = {}) {
       const token = await getPaypalAccessToken(
         `${effectiveBaseUrl}/v1/oauth2/token`,
         effectiveClientId,
-        effectiveClientSecret
+        effectiveClientSecret,
+        fetchImpl
       );
       const order = await getJson(
         `${effectiveBaseUrl}/v2/checkout/orders/${encodeURIComponent(orderId)}`,
-        token
+        token,
+        fetchImpl
       );
       const status = String(order?.status || "").toUpperCase();
-      if (!["COMPLETED", "APPROVED"].includes(status)) {
+      if (status !== "COMPLETED") {
         throw new Error(`paypal order not complete (status=${status || "unknown"})`);
       }
+      if (order.id !== orderId) throw new Error("paypal order ID mismatch");
       assertOrderMatchesCatalog(order, catalogEntry);
 
-      if (catalogEntry.type === "consumable") {
-        return {
-          provider,
-          externalTransactionId: orderId,
-          type: "consumable",
-          gameId: catalogEntry.gameId,
-          coinsDelta: Number(catalogEntry.coins) || 0,
-          subscription: null
-        };
-      }
-      const expiresAt = Number(payload?.expires_at || 0);
-      const now = normalizeNow(nowSeconds);
-      const active = Number.isFinite(expiresAt) ? expiresAt > now : true;
       return {
         provider,
         externalTransactionId: orderId,
-        type: "subscription",
-        gameId: "",
-        coinsDelta: 0,
-        subscription: {
-          provider,
-          externalSubscriptionId: orderId,
-          status: active ? "active" : "expired",
-          active,
-          expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? Math.floor(expiresAt) : undefined
-        }
+        type: "consumable",
+        gameId: catalogEntry.gameId,
+        coinsDelta: Number(catalogEntry.coins) || 0,
+        subscription: null
       };
     }
   };
 }
 
 function assertOrderMatchesCatalog(order, catalogEntry) {
-  const expectedPrice = Number(catalogEntry?.price || 0);
-  const expectedCurrency = String(catalogEntry?.currency || "").trim().toUpperCase();
-  const unit = order?.purchase_units?.[0] || {};
-  const amount = unit?.amount || {};
-  const orderValue = Number(amount?.value || 0);
-  const orderCurrency = String(amount?.currency_code || "").trim().toUpperCase();
-
-  if (expectedCurrency && orderCurrency && expectedCurrency !== orderCurrency) {
-    throw new Error(
-      `paypal currency mismatch (expected=${expectedCurrency}, actual=${orderCurrency})`
-    );
+  const units = order.purchase_units;
+  if (!Array.isArray(units) || units.length !== 1) {
+    throw new Error("paypal requires one fully captured purchase unit");
   }
+  const captures = units[0]?.payments?.captures;
+  if (!Array.isArray(captures) || captures.length !== 1 ||
+      !captures[0]?.id || captures[0].status !== "COMPLETED") {
+    throw new Error("paypal completed capture is required");
+  }
+  assertAmount(units[0].amount, catalogEntry);
+  assertAmount(captures[0].amount, catalogEntry);
+}
 
-  if (expectedPrice > 0 && Number.isFinite(orderValue)) {
-    const delta = Math.abs(expectedPrice - orderValue);
-    if (delta > 0.01) {
-      throw new Error(
-        `paypal amount mismatch (expected=${expectedPrice.toFixed(2)}, actual=${orderValue.toFixed(2)})`
-      );
-    }
+function assertAmount(amount, catalogEntry) {
+  const expected = Number(catalogEntry.price);
+  const currency = String(catalogEntry.currency || "").trim().toUpperCase();
+  const value = amount?.value;
+  if (!Number.isFinite(expected) || expected <= 0 || !currency ||
+      typeof value !== "string" || !/^\d+(?:\.\d{1,2})?$/.test(value) ||
+      amount.currency_code !== currency ||
+      Math.round(Number(value) * 100) !== Math.round(expected * 100)) {
+    throw new Error("paypal captured amount/currency does not match catalog");
   }
 }
 
-async function getPaypalAccessToken(tokenUrl, clientId, clientSecret) {
+async function getPaypalAccessToken(tokenUrl, clientId, clientSecret, fetchImpl) {
   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
-  const response = await fetch(tokenUrl, {
+  const response = await fetchImpl(tokenUrl, {
     method: "POST",
     headers: {
       authorization: `Basic ${basic}`,
@@ -107,8 +98,8 @@ async function getPaypalAccessToken(tokenUrl, clientId, clientSecret) {
   return String(json.access_token);
 }
 
-async function getJson(url, accessToken) {
-  const response = await fetch(url, {
+async function getJson(url, accessToken, fetchImpl) {
+  const response = await fetchImpl(url, {
     method: "GET",
     headers: {
       authorization: `Bearer ${accessToken}`
@@ -119,11 +110,4 @@ async function getJson(url, accessToken) {
     throw new Error(`paypal verify failed (${response.status})`);
   }
   return json;
-}
-
-function normalizeNow(nowSeconds) {
-  if (Number.isFinite(Number(nowSeconds)) && Number(nowSeconds) > 0) {
-    return Math.floor(Number(nowSeconds));
-  }
-  return Math.floor(Date.now() / 1000);
 }

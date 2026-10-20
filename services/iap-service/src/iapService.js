@@ -6,6 +6,13 @@ import { createNoopIapRuntimeConfigProvider } from "./runtimeConfigProvider.js";
 
 export function createIapService(options = {}) {
   const store = options.store || new InMemoryIapStore();
+  // Tests may inject server time at construction; requests never supply it.
+  const clock = options.clock || (() => Math.floor(Date.now() / 1000));
+  const now = () => {
+    const value = clock();
+    if (!Number.isFinite(value) || value <= 0) throw new Error("invalid server clock");
+    return Math.floor(value);
+  };
   const baseCatalog = createCatalog(options.catalog || {});
   const providers =
     options.providerRegistry || createProviderRegistry(options.providers || {});
@@ -18,7 +25,7 @@ export function createIapService(options = {}) {
     ]);
     return {
       profile_id: profileId,
-      no_ads: normalizeSubscription(noAds),
+      no_ads: normalizeSubscription(noAds, now()),
       coins
     };
   };
@@ -49,17 +56,23 @@ export function createIapService(options = {}) {
       const runtimeCatalog = normalizeObject(runtimeConfig?.iapCatalog);
       const catalog = mergeCatalog(baseCatalog, runtimeCatalog);
       const iapProviderConfigs = normalizeObject(runtimeConfig?.iapProviderConfigs);
-      const normalized = await normalizePurchase({
-        profileId,
-        provider,
-        productId,
-        payload,
-        catalog,
-        exportTarget,
-        providers,
-        gameId: normalizedGameId,
-        iapProviderConfigs
-      });
+      let normalized;
+      try {
+        normalized = await normalizePurchase({
+          profileId,
+          provider,
+          productId,
+          payload,
+          catalog,
+          exportTarget,
+          providers,
+          gameId: normalizedGameId,
+          iapProviderConfigs,
+          nowSeconds: now()
+        });
+      } catch (error) {
+        throw new PurchaseVerificationError(error.message);
+      }
       const dedupe = await store.applyTransaction(
         normalized.provider,
         normalized.externalTransactionId,
@@ -91,22 +104,12 @@ export function createIapService(options = {}) {
         entitlements
       };
     },
-    applyWebhookEvent: async ({ provider, body }) => {
-      const normalizedBody = body && typeof body === "object" ? body : {};
-      const profileId = String(normalizedBody.profile_id || "").trim();
-      const productId = String(normalizedBody.product_id || "").trim();
-      const exportTarget = String(normalizedBody.export_target || "").trim();
-      if (!profileId || !productId) {
-        throw new Error("webhook payload requires profile_id and product_id");
-      }
-      return this.verifyPurchase({
-        profileId,
-        provider,
-        productId,
-        exportTarget,
-        gameId: normalizedBody.game_id || "",
-        payload: normalizedBody.payload || normalizedBody
-      });
+    applyWebhookEvent: async ({ provider }) => {
+      normalizeProvider(provider);
+      // Native provider notifications require authenticated envelopes and a
+      // server-owned account/product mapping. No verified adapter exists yet.
+      // Reject explicitly instead of calling an arrow function's lexical `this`.
+      throw new WebhookUnavailableError();
     },
     mergeProfiles: async ({ primaryProfileId, secondaryProfileId }) => {
       assertRequiredString(primaryProfileId, "primaryProfileId");
@@ -181,13 +184,16 @@ async function normalizePurchase(input) {
   }
   const target = normalizeExportTarget(input.exportTarget || input.payload?.export_target);
   enforceProviderForTarget(provider, target);
-  const payload = input.payload && typeof input.payload === "object" ? input.payload : {};
+  if (!input.payload || typeof input.payload !== "object" || Array.isArray(input.payload)) {
+    throw new Error("payload must be an object");
+  }
+  const payload = input.payload;
   const verified = await input.providers.verifyPurchase({
     provider,
     productId,
     payload,
     catalogEntry,
-    nowSeconds: payload.now_seconds,
+    nowSeconds: input.nowSeconds,
     providerConfig: resolveProviderConfig(input.iapProviderConfigs, provider),
     gameId: expectedGameId
   });
@@ -267,21 +273,35 @@ function normalizeObject(value) {
   return value;
 }
 
-function normalizeSubscription(sub) {
-  const active = Boolean(sub?.active);
-  const status = String(sub?.status || (active ? "active" : "none"));
+function normalizeSubscription(sub, nowSeconds) {
   const expires = Number(sub?.expiresAt);
-  if (Number.isFinite(expires) && expires > 0) {
-    return {
-      active,
-      status,
-      expires_at: Math.floor(expires)
-    };
+  const validExpiry = Number.isFinite(expires) && expires > 0;
+  const active = sub?.active === true && validExpiry && expires > nowSeconds;
+  let status = String(sub?.status || (sub?.active === true ? "active" : "none"));
+  if (validExpiry && expires <= nowSeconds && (sub?.active === true || status === "active")) {
+    status = "expired";
+  } else if (!validExpiry && sub?.active === true) {
+    status = "invalid_expiry";
   }
   return {
     active,
-    status
+    status,
+    ...(validExpiry ? { expires_at: Math.floor(expires) } : {})
   };
+}
+
+export class PurchaseVerificationError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "PurchaseVerificationError";
+  }
+}
+
+export class WebhookUnavailableError extends Error {
+  constructor() {
+    super("Verified provider webhook processing is not configured");
+    this.name = "WebhookUnavailableError";
+  }
 }
 
 function normalizeProvider(provider) {

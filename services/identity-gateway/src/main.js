@@ -26,6 +26,7 @@ async function main() {
 
   const service = createIdentityGatewayService({
     identityStore: await createIdentityStore(config),
+    nakamaExchangeKeysJson: process.env.NAKAMA_EXCHANGE_KEYS_JSON,
     mergeCoordinator: createHttpMergeCoordinator({
       adminKey: config.internalServiceKey,
       iapMergeUrl: config.iapMergeUrl,

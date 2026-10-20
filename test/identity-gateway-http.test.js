@@ -17,6 +17,7 @@ describe("identity-gateway http", () => {
   const sessionSecret = "identity-session-secret-12345";
   let lastMagicLink = "";
   const service = createIdentityGatewayService({
+    nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
     sessionSecret,
     sessionIssuer: "terapixel.identity",
     sessionAudience: "terapixel.game",
@@ -90,6 +91,7 @@ describe("identity-gateway http", () => {
     const response = await fetch(`${baseUrl}/v1/auth/nakama`, {
       method: "POST",
       headers: {
+        "x-nakama-exchange-key": "test-lumarush-backend-key-32-bytes-long",
         "content-type": "application/json"
       },
       body: JSON.stringify({
@@ -271,6 +273,7 @@ describe("identity-gateway http", () => {
     const authResponse = await fetch(`${baseUrl}/v1/auth/nakama`, {
       method: "POST",
       headers: {
+        "x-nakama-exchange-key": "test-lumarush-backend-key-32-bytes-long",
         "content-type": "application/json"
       },
       body: JSON.stringify({

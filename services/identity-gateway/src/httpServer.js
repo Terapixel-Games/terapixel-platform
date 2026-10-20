@@ -1,5 +1,6 @@
 import http from "node:http";
 import crypto from "node:crypto";
+import { NakamaExchangeAuthError } from "./identityGatewayService.js";
 import {
   JwtValidationError,
   createSessionToken,
@@ -99,6 +100,9 @@ export function createIdentityGatewayHttpServer(options = {}) {
         requestId
       });
     } catch (error) {
+      if (error instanceof NakamaExchangeAuthError) {
+        error = new HttpError(401, "unauthorized", error.message);
+      }
       if (error instanceof HttpError) {
         writeJson(res, error.statusCode, {
           request_id: requestId,
@@ -353,8 +357,8 @@ async function handleRequest(req, res, ctx) {
     const result = await ctx.service.authenticateNakamaUser({
       nakamaUserId,
       gameId,
-      displayName: body.display_name,
-      nowSeconds: body.nowSeconds
+      backendKey: req.headers["x-nakama-exchange-key"],
+      displayName: body.display_name
     });
     writeJson(res, 200, {
       request_id: ctx.requestId,

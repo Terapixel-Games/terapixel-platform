@@ -22,3 +22,5 @@
 !scripts/
 !scripts/cloudrun/
 !scripts/cloudrun/deploy-identity-staging.sh
+
+!scripts/cloudrun/deploy-data-staging.py

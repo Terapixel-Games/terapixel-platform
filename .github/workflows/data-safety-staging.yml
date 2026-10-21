@@ -1,0 +1,66 @@
+name: Data Safety Staging
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: data-safety-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: staging
+    env:
+      GCP_PROJECT_ID: terapixel-platform-staging
+      GCP_REGION: us-central1
+      GCP_SERVICE_ACCOUNT: github-cloudrun-deployer@terapixel-platform-staging.iam.gserviceaccount.com
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - name: Verify exact main source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_REF" = refs/heads/main
+      - name: Required real PostgreSQL regressions
+        run: sh tools/test-compose.sh
+      - name: Authenticate existing deployment identity
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193 # v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f33d12def9a # v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+      - name: Build and push only the three affected services
+        id: images
+        run: |
+          set -euo pipefail
+          test -n "$GCP_WORKLOAD_IDENTITY_PROVIDER"
+          gcloud auth configure-docker us-central1-docker.pkg.dev --account="$GCP_SERVICE_ACCOUNT" --quiet
+          for service in identity-gateway save-service iap-service; do
+            image="us-central1-docker.pkg.dev/terapixel-platform-staging/terapixel-platform/${service}:main-${GITHUB_SHA}"
+            docker build --label "org.opencontainers.image.revision=${GITHUB_SHA}" -f "services/${service}/Dockerfile" -t "$image" .
+            docker push "$image"
+            digest="$(gcloud artifacts docker images describe "$image" --account="$GCP_SERVICE_ACCOUNT" --project=terapixel-platform-staging --format='value(image_summary.digest)')"
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            echo "${service}=${image%:*}@${digest}" >> "$GITHUB_OUTPUT"
+          done
+      - name: Deploy only affected services and preserve runtime security
+        env:
+          IDENTITY_GATEWAY_IMAGE: ${{ steps.images.outputs.identity-gateway }}
+          SAVE_SERVICE_IMAGE: ${{ steps.images.outputs.save-service }}
+          IAP_SERVICE_IMAGE: ${{ steps.images.outputs.iap-service }}
+        run: python3 scripts/cloudrun/deploy-data-staging.py

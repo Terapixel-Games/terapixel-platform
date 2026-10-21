@@ -23,6 +23,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
+      IAP_TEST_LOCAL_DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
+      CONSUMPTION_TEST_LOCAL_DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
+      SAVE_TEST_LOCAL_DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
+      TPX_ISOLATED_COMPOSE_TEST: '1'
       NODE_ENV: test
     read_only: true
     tmpfs:

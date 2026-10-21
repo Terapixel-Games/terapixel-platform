@@ -1,3 +1,4 @@
+import { localPostgresUrl } from "../tools/test-helpers/localPostgresUrl.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PostgresIdentityStore } from "../services/identity-gateway/index.js";
@@ -7,10 +8,7 @@ import { PostgresIapStore } from "../services/iap-service/index.js";
 const testOptions = { skip: !process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL, timeout: 30_000 };
 let schemaSequence = 0;
 async function withDatabase(run) {
-  const url = new URL(process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL);
-  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
-  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "database must be loopback");
-  assert.equal(url.search, "", "connection-string overrides are forbidden");
+  const url = localPostgresUrl(process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL);
   const { default: pg } = await import("pg");
   const schema = `consumption_test_${process.pid}_${Date.now()}_${schemaSequence++}`;
   const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });

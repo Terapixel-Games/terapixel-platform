@@ -16,7 +16,7 @@ it('workflow is manual, main-only, fixed staging and uses full action SHAs',asyn
 });
 for(const failure of [null,'metadata','smoke'])it(`targeted release ${failure||'success'} preserves safety boundary (mock CLI)`,async()=>{
  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'gateway-release-test-'));const bin=path.join(dir,'bin');await fs.mkdir(bin);
- const env={...process.env,PATH:bin+':'+process.env.PATH,RUNNER_TEMP:dir,GITHUB_REF:'refs/heads/main',GITHUB_SHA:'a'.repeat(40),GATEWAY_IMAGE:image,GITHUB_STEP_SUMMARY:path.join(dir,'summary'),MOCK_DIR:dir,MOCK_FAILURE:failure||''};
+ const env={...process.env,PATH:bin+':'+process.env.PATH,RUNNER_TEMP:dir,GITHUB_REF:'refs/heads/main',GITHUB_SHA:'a'.repeat(40),GATEWAY_IMAGE:image,GITHUB_STEP_SUMMARY:path.join(dir,'summary'),MOCK_DIR:dir,MOCK_SCRIPT:script.pathname,MOCK_FAILURE:failure||''};
  const mock=`#!/usr/bin/env python3
 import os,sys,json,pathlib
 p=pathlib.Path(os.environ['MOCK_DIR']);a=sys.argv[1:]
@@ -49,8 +49,11 @@ if (p/'promoted').exists() and os.environ['MOCK_FAILURE']=='smoke' and url.endsw
 pathlib.Path(out).write_text(json.dumps(body));print(code,end='')
 `;
  try{
-  await fs.writeFile(path.join(bin,'gcloud'),mock,{mode:0o700});await fs.writeFile(path.join(bin,'curl'),curl,{mode:0o700});
-  const run=spawnSync('bash',[script.pathname],{env,encoding:'utf8'});
+  // Read fixtures through the interpreter: /tmp is deliberately noexec in the
+  // isolated runner. No executable temp files or relaxed mount flags are needed.
+  await fs.writeFile(path.join(dir,'gcloud.py'),mock);await fs.writeFile(path.join(dir,'curl.py'),curl);
+  await fs.writeFile(path.join(dir,'shims'), 'gcloud() { python3 "$MOCK_DIR/gcloud.py" "$@"; }\ncurl() { python3 "$MOCK_DIR/curl.py" "$@"; }\n');
+  const run=spawnSync('bash',['-c','source "$MOCK_DIR/shims"; source "$MOCK_SCRIPT"'],{env,encoding:'utf8'});
   assert.equal(run.status===0,failure===null,run.stderr);
   const calls=(await fs.readFile(path.join(dir,'calls'),'utf8')).trim().split('\n').map(JSON.parse);
   assert.equal(calls.filter(x=>x[2]==='update').length,1);assert.equal(calls.filter(x=>x[2]==='update-traffic').length,failure==='metadata'?0:1);

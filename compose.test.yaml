@@ -1,0 +1,38 @@
+services:
+  postgres:
+    image: postgres:16-bookworm@sha256:07f75b9a180f8c1feb17354ea9dcc556876d805802412f71b2173ff0c8f0b176
+    environment:
+      POSTGRES_USER: terapixel_test
+      POSTGRES_PASSWORD: synthetic-local-only
+      POSTGRES_DB: terapixel_test
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -h 127.0.0.1 -U terapixel_test -d terapixel_test']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks: [test]
+  runner:
+    build:
+      context: .
+      dockerfile: infra/testing/Dockerfile
+      args:
+        TEST_NODE_IMAGE: "${TEST_NODE_IMAGE:-node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
+      NODE_ENV: test
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    networks: [test]
+networks:
+  test:
+    internal: true

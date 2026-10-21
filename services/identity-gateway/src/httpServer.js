@@ -90,6 +90,7 @@ export function createIdentityGatewayHttpServer(options = {}) {
       await handleRequest(req, res, {
         service,
         authConfig,
+        edgeIngressSecret: String(options.edgeIngressSecret || "").trim(),
         internalServiceKey: String(options.internalServiceKey || ""),
         sessionConfig,
         sessionVerifier,
@@ -148,6 +149,11 @@ async function handleRequest(req, res, ctx) {
     });
     return;
   }
+
+  requireEdgeIngress(req, urlPath, {
+    expected: ctx.edgeIngressSecret,
+    sessionJwksPath: ctx.sessionJwksPath
+  });
 
   if (req.method === "GET" && urlPath === "/v1/web/session") {
     const sessionToken = extractSessionCookie(
@@ -604,9 +610,35 @@ function requireAdminKey(req, expectedKey) {
     throw new HttpError(500, "config_error", "internal service key not configured");
   }
   const provided = String(req.headers["x-admin-key"] || "").trim();
-  if (!provided || provided !== expected) {
+  if (!provided || !timingSafeEquals(provided, expected)) {
     throw new HttpError(401, "unauthorized", "invalid admin key");
   }
+}
+
+function requireEdgeIngress(req, urlPath, options = {}) {
+  const expected = String(options.expected || "").trim();
+  if (!expected) {
+    return;
+  }
+  if (urlPath === "/healthz" || urlPath === String(options.sessionJwksPath || "")) {
+    return;
+  }
+  if (urlPath.startsWith("/v1/identity/internal/")) {
+    return;
+  }
+  const provided = String(req.headers["x-terapixel-origin-secret"] || "").trim();
+  if (!provided || !timingSafeEquals(provided, expected)) {
+    throw new HttpError(403, "forbidden", "missing or invalid edge ingress secret");
+  }
+}
+
+function timingSafeEquals(left, right) {
+  const leftBytes = Buffer.from(String(left || ""), "utf8");
+  const rightBytes = Buffer.from(String(right || ""), "utf8");
+  if (leftBytes.length !== rightBytes.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(leftBytes, rightBytes);
 }
 
 function extractProfileIdFromClaims(claims, sessionConfig = {}) {

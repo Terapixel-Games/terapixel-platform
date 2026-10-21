@@ -227,3 +227,53 @@ no existing database cluster was modified and no credentials were generated.
 
 References: https://node-postgres.com/features/transactions and
 https://www.postgresql.org/docs/14/explicit-locking.html.
+
+### Staging replacement: preserve deployed edge ingress
+
+The staging image identified by digest
+`sha256:c872c6454424a39e2b04161812985e2073bfd3c418aad71aac31895f7829d0a6`
+contains an ingress guard absent from repository history. The replacement preserves
+its recovered implementation: when `EDGE_INGRESS_SECRET` is configured,
+`x-terapixel-origin-secret` is required outside health/JWKS and the existing
+`/v1/identity/internal/` exemption. Those internal routes still require their admin
+key. OPTIONS handling and public web/magic-link behavior through the trusted edge
+remain unchanged. Secret comparisons use the recovered constant-time helper.
+No runtime secret values were recovered from the image or added to this repository.
+
+This origin proof is distinct from `x-nakama-exchange-key`: backend exchanges must
+satisfy both existing ingress policy and the dedicated backend proof. Global player
+sessions remain intentional; no consumer game_id rejection is included. Without
+approved exchange-key configuration, Nakama exchange remains fail-closed.
+
+Main pushes no longer trigger the all-service Cloud Run deployment workflow.
+Existing version-tag/manual entrypoints remain; operators must not dispatch that
+workflow for an identity-only release because it deploys every manifest service.
+The scoped staging replacement targets only `terapixel-identity-gateway` in
+`terapixel-platform-staging`, `us-central1`, from reviewed main, using an image-only
+service update preserving existing runtime identity, environment, secret references,
+IAM and ingress settings. Record the old revision/digest before any deployment.
+
+### Gateway-only staging workflow
+
+`Identity Gateway Staging` (`identity-gateway-staging.yml`) is manual and runs only
+on `main` in the existing GitHub `staging` environment. It uses the established
+`github-cloudrun-deployer@terapixel-platform-staging.iam.gserviceaccount.com` OIDC
+identity and existing workload-identity provider. It does not use the default
+Compute service account or grant permissions. All actions are pinned to verified
+full commit SHAs.
+
+The job tests the exact main commit, builds only the gateway Dockerfile, pushes to
+the existing staging repository, resolves an immutable digest and updates only
+`terapixel-identity-gateway` in `us-central1`. It creates the new revision without
+traffic, checks readiness and compares runtime-account/resource/secret-reference,
+ingress and IAM metadata before routing traffic. No environment/secret/IAM flags
+are applied. The previous serving revision is recorded for rollback.
+
+Read-only smoke checks compare health status with baseline, verify the public JWKS
+response, and require the existing missing-origin 403 on web/session. The existing
+Cloud Run URL returned healthz 404 before this rollout; the job records that result
+rather than claiming an application-health 200. Local application health remains
+covered by tests. No sign-in mutations, origin-secret reads or invented identities
+are used in live smoke checks. Credentials for Nakama exchange remain a separate
+approval; exchange stays disabled without them. The job records failure without
+bypassing a rejected permission or silently weakening protection.

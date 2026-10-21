@@ -1,3 +1,4 @@
+import { localPostgresUrl } from "../tools/test-helpers/localPostgresUrl.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { PostgresSaveStore, createSaveService, createDefaultSaveEnvelope } from "../services/save-service/index.js";
@@ -6,10 +7,7 @@ it("real local PostgreSQL: concurrent save retries and atomic migration rollback
   skip: !process.env.SAVE_TEST_LOCAL_DATABASE_URL, timeout: 30_000
 }, async () => {
   // Explicit opt-in only; never fall back to production DATABASE_URL.
-  const url = new URL(process.env.SAVE_TEST_LOCAL_DATABASE_URL);
-  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
-  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
-  assert.equal(url.search, "", "connection-string overrides are forbidden");
+  const url = localPostgresUrl(process.env.SAVE_TEST_LOCAL_DATABASE_URL);
   const { default: pg } = await import("pg");
   const schema = `save_test_${process.pid}_${Date.now()}`;
   const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
@@ -55,6 +53,38 @@ it("real local PostgreSQL: concurrent save retries and atomic migration rollback
     assert.equal((await a.get("game", "primary")).payload.games_played, 9);
     assert.equal((await a.get("game", "primary")).payload.high_score, 400);
     assert.equal(await a.get("game", "secondary"), null);
+
+    // Hold the real source row lock after reading an absent destination, then
+    // let another connection create that destination. INSERT must lose safely,
+    // rollback, and the service must retry/remerge on a fresh transaction.
+    await a.put(envelope("race-secondary", { games_played: 13, secondary_flag: true }));
+    let entered, resume, selections = 0;
+    const selected = new Promise((resolve) => { entered = resolve; });
+    const gate = new Promise((resolve) => { resume = resolve; });
+    const paused = new PostgresSaveStore({ pool: {
+      query: pool.query.bind(pool),
+      async connect() {
+        const client = await pool.connect();
+        return {
+          async query(sql, params) {
+            const result = await client.query(sql, params);
+            if (/ORDER BY profile_id FOR UPDATE/.test(sql) && ++selections === 1) { entered(); await gate; }
+            return result;
+          }, release: client.release.bind(client)
+        };
+      }
+    } });
+    const migration = createSaveService({ saveStore: paused }).mergeProfiles({ primaryProfileId: "race-primary", secondaryProfileId: "race-secondary", nowSeconds: 200 });
+    await selected;
+    try {
+      await createSaveService({ saveStore: b }).syncSave({ gameId: "game", profileId: "race-primary", clientEnvelope: envelope("race-primary", { high_score: 900, primary_flag: true }) });
+    } finally { resume(); }
+    await migration;
+    const raced = await a.get("game", "race-primary");
+    assert.ok(selections >= 2, "destination race must rollback and retry from fresh rows");
+    assert.equal(raced.payload.high_score, 900); assert.equal(raced.payload.games_played, 13);
+    assert.equal(raced.payload.primary_flag, true); assert.equal(raced.payload.secondary_flag, true);
+    assert.equal(await a.get("game", "race-secondary"), null);
   } finally {
     if (pool) await pool.end();
     try { if (created) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }

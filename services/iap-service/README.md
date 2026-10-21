@@ -158,3 +158,20 @@ subscription/provider/webhook behavior is unchanged.
 scripted clients. Optional real local DB tests and installed-tool availability
 are documented in the identity-gateway README. Real PostgreSQL concurrency,
 rollback and lock behavior have not been executed here and remain a release gate.
+
+
+## Data-safety review scope
+
+This draft is stacked on the PR8 harness branch `test/docker-compose-local`.
+It combines atomic wallet operations, serialized JSON mutations, pinned PostgreSQL
+profile transfers and identity consumption, and revision-safe saves. It deliberately
+excludes billing lifecycle commit `6c086b9`/`b477c66`: provider verification, webhook
+processing, subscription clock/expiry behavior remain baseline main behavior and are
+not certified by this PR. No blanket session game binding is included.
+
+Mandatory Compose CI runs the real PostgreSQL atomicity/consumption/save tests;
+purchase provider verification is mocked and never calls live providers. Historical
+notes above about unexecuted PostgreSQL checks describe the original patch stage,
+not the separately recorded local validation. Production-scale table-lock latency,
+provider lifecycle correctness, cross-service merge recovery and rollout remain
+separate review gates. No merge or deployment is authorized by this publication.

@@ -1,3 +1,4 @@
+import { localPostgresUrl } from "../tools/test-helpers/localPostgresUrl.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { createIapService, PostgresIapStore } from "../services/iap-service/index.js";
@@ -8,10 +9,7 @@ it("real local PostgreSQL: atomic grants, failed-debit retries and concurrent sp
   skip: !process.env.IAP_TEST_LOCAL_DATABASE_URL,
   timeout: 30_000
 }, async () => {
-  const url = new URL(process.env.IAP_TEST_LOCAL_DATABASE_URL);
-  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
-  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "integration DB must be loopback");
-  assert.equal(url.search, "", "connection-string query overrides are not allowed");
+  const url = localPostgresUrl(process.env.IAP_TEST_LOCAL_DATABASE_URL);
   const { default: pg } = await import("pg");
   const schema = `iap_atomic_test_${process.pid}_${Date.now()}`;
   const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });

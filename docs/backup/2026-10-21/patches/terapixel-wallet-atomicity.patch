@@ -1,0 +1,764 @@
+From 77bb6ac7e7ee6758e553e5eded8bde9e6708ba51 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 13:54:24 -0500
+Subject: [PATCH] Commit IAP deduplication and wallet benefits atomically
+
+---
+ services/iap-service/README.md                |  48 +++++++
+ services/iap-service/src/iapService.js        |  29 ++--
+ services/iap-service/src/store/iapStore.js    | 115 +++++++++++-----
+ .../iap-service/src/store/postgresIapStore.js |  67 ++++++++-
+ .../src/store/transactionEffect.js            |  12 ++
+ test/iap-atomicity.test.js                    | 130 ++++++++++++++++++
+ test/postgres-iap-atomicity.test.js           | 106 ++++++++++++++
+ test/postgres-iap-integration.test.js         |  68 +++++++++
+ 8 files changed, 512 insertions(+), 63 deletions(-)
+ create mode 100644 services/iap-service/src/store/transactionEffect.js
+ create mode 100644 test/iap-atomicity.test.js
+ create mode 100644 test/postgres-iap-atomicity.test.js
+ create mode 100644 test/postgres-iap-integration.test.js
+
+diff --git a/services/iap-service/README.md b/services/iap-service/README.md
+index fe7b006..9016c5a 100644
+--- a/services/iap-service/README.md
++++ b/services/iap-service/README.md
+@@ -55,3 +55,51 @@ Purpose: purchase verification and entitlement source of truth.
+ - `poki` -> `paypal_web`
+ - `crazygames` -> `paypal_web`
+ - `web` -> `paypal_web`
++
++## Atomic purchase grants and wallet adjustments
++
++`verifyPurchase` and `adjustCoins` use the store contract
++`applyTransaction(provider, externalTransactionId, record, effect)`. `effect` is
++one coin delta (`{ coins: { gameId, delta } }`) or the existing normalized
++subscription value. The successful deduplication record and benefit are committed
++together; insufficient funds or a failed grant does not consume the success key.
++Concurrent duplicate transactions apply once. Distinct concurrent spends use a
++conditional debit and cannot spend more than the available wallet balance.
++Integer deltas/balances use the existing PostgreSQL signed INT range.
++
++PostgreSQL uses `pool.connect()` and one pinned client for BEGIN, dedupe INSERT,
++conditional wallet UPDATE (or existing subscription write), and COMMIT. Errors
++ROLLBACK before releasing; rollback failures discard the connection and preserve
++the original error. A response/connection failure around COMMIT can leave the
++caller uncertain about success; retry with the same key rather than a new key.
++The committed record prevents a repeated grant after a successful commit.
++No schema migration is required. Historical records that were already saved
++without a matching grant are not repaired automatically by this patch.
++
++The memory implementation publishes each operation without asynchronous gaps.
++The JSON file implementation serializes these transactions, writes a staged
++snapshot using the existing temporary-file/rename pattern, then publishes the
++in-memory state. A failed snapshot write leaves the operation retryable. File
++mode is single-instance/single-writer only; it provides no cross-process locking
++or fsync-based power-loss durability. Legacy standalone store mutators remain
++for existing setup/merge paths; do not compose them for purchase/wallet writes.
++Concurrent profile merges versus wallet operations are outside this patch and
++have not been made transactionally safe. Subscription/provider/webhook behavior
++and save/merge implementations are otherwise unchanged.
++
++Validation:
++
++- `node --test test/iap-atomicity.test.js test/postgres-iap-atomicity.test.js`:
++  memory/file concurrency, fault and retry coverage plus scripted PostgreSQL
++  pinned-client/rollback tests. The latter mocks SQL responses and does not prove
++  real PostgreSQL lock behavior.
++- `test/postgres-iap-integration.test.js` is an opt-in real PostgreSQL test. With
++  dependencies installed and an already-running disposable local database,
++  supply `IAP_TEST_LOCAL_DATABASE_URL` pointing only to loopback, with no URL query
++  parameters, and run `node --test test/postgres-iap-integration.test.js`.
++  It creates/drops an isolated schema, injects a grant failure with a database
++  trigger, and tests concurrent duplicate grants/spends and funded retries.
++  It never reads `DATABASE_URL` and is skipped unless explicitly configured.
++
++No database/server, credentials, or live settings are provisioned by these changes.
++Review and merge this independent patch to main before staging or production.
+diff --git a/services/iap-service/src/iapService.js b/services/iap-service/src/iapService.js
+index 8140bdf..fb49cb0 100644
+--- a/services/iap-service/src/iapService.js
++++ b/services/iap-service/src/iapService.js
+@@ -60,7 +60,7 @@ export function createIapService(options = {}) {
+         gameId: normalizedGameId,
+         iapProviderConfigs
+       });
+-      const dedupe = await store.recordTransaction(
++      const dedupe = await store.applyTransaction(
+         normalized.provider,
+         normalized.externalTransactionId,
+         {
+@@ -69,7 +69,10 @@ export function createIapService(options = {}) {
+           type: normalized.type,
+           productId: normalized.productId,
+           normalized
+-        }
++        },
++        normalized.type === "consumable"
++          ? { coins: { gameId: normalized.gameId, delta: normalized.coinsDelta } }
++          : { subscription: normalized.subscription }
+       );
+ 
+       if (!dedupe.isNew) {
+@@ -81,12 +84,6 @@ export function createIapService(options = {}) {
+         };
+       }
+ 
+-      if (normalized.type === "consumable") {
+-        await store.addCoins(profileId, normalized.gameId, normalized.coinsDelta);
+-      } else if (normalized.subscription) {
+-        await store.upsertSubscription(profileId, normalized.subscription);
+-      }
+-
+       const entitlements = await getEntitlementsInternal(profileId);
+       return {
+         deduplicated: false,
+@@ -129,21 +126,21 @@ export function createIapService(options = {}) {
+         throw new Error("gameId is required");
+       }
+       const deltaInt = Math.floor(Number(delta) || 0);
+-      if (deltaInt === 0) {
+-        throw new Error("delta must be non-zero");
++      if (!Number.isSafeInteger(deltaInt) || deltaInt === 0) {
++        throw new Error("delta must be a finite non-zero integer");
+       }
+       const dedupeKey = String(idempotencyKey || "").trim();
+       if (!dedupeKey) {
+         throw new Error("idempotencyKey is required");
+       }
+ 
+-      const tx = await store.recordTransaction("internal_coin_adjust", dedupeKey, {
++      const tx = await store.applyTransaction("internal_coin_adjust", dedupeKey, {
+         profileId,
+         gameId: normalizedGameId,
+         type: "coin_adjust",
+         reason: String(reason || "").trim(),
+         delta: deltaInt
+-      });
++      }, { coins: { gameId: normalizedGameId, delta: deltaInt } });
+       if (!tx.isNew) {
+         const entitlements = await getEntitlementsInternal(profileId);
+         return {
+@@ -154,14 +151,6 @@ export function createIapService(options = {}) {
+         };
+       }
+ 
+-      if (deltaInt < 0) {
+-        const balances = await store.getCoins(profileId);
+-        const current = Number(balances?.[normalizedGameId]?.balance || 0);
+-        if (current + deltaInt < 0) {
+-          throw new Error("insufficient coins");
+-        }
+-      }
+-      await store.addCoins(profileId, normalizedGameId, deltaInt);
+       const entitlements = await getEntitlementsInternal(profileId);
+       return {
+         deduplicated: false,
+diff --git a/services/iap-service/src/store/iapStore.js b/services/iap-service/src/store/iapStore.js
+index 1550ffd..327a227 100644
+--- a/services/iap-service/src/store/iapStore.js
++++ b/services/iap-service/src/store/iapStore.js
+@@ -1,5 +1,6 @@
+ import fs from "node:fs/promises";
+ import path from "node:path";
++import { validateTransactionEffect } from "./transactionEffect.js";
+ 
+ export class InMemoryIapStore {
+   constructor(seed = {}) {
+@@ -9,6 +10,34 @@ export class InMemoryIapStore {
+     hydrateSeed(this, seed);
+   }
+ 
++  // No awaits between validation and publication: each call commits in one JS turn.
++  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
++    validateTransactionEffect(record, effect);
++    const key = txKey(provider, externalTransactionId);
++    if (this._transactions.has(key)) {
++      return { isNew: false, record: deepClone(this._transactions.get(key)) };
++    }
++    const copy = deepClone(record);
++    const result = { isNew: true, record: deepClone(copy) };
++    const subscription = effect.subscription ? deepClone(effect.subscription) : null;
++    let coinKey;
++    let balance;
++    if (effect.coins) {
++      coinKey = balanceKey(record.profileId, effect.coins.gameId);
++      const current = this._coinBalances.get(coinKey)?.balance || 0;
++      balance = current + effect.coins.delta;
++      if (balance < 0) throw new Error("insufficient coins");
++      if (!Number.isSafeInteger(balance) || balance > 2147483647) {
++        throw new Error("coin balance exceeds supported range");
++      }
++    }
++    // All potentially throwing input processing finishes before modifying state.
++    if (effect.coins) this._coinBalances.set(coinKey, { balance });
++    if (subscription) this._subscriptions.set(normalize(record.profileId), subscription);
++    this._transactions.set(key, copy);
++    return result;
++  }
++
+   async recordTransaction(provider, externalTransactionId, record) {
+     const key = txKey(provider, externalTransactionId);
+     if (this._transactions.has(key)) {
+@@ -92,10 +121,30 @@ export class JsonFileIapStore extends InMemoryIapStore {
+       throw new Error("JsonFileIapStore filePath is required");
+     }
+     this._filePath = filePath;
+-    this._loaded = false;
+     this._writeQueue = Promise.resolve();
+   }
+ 
++  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
++    const operation = this._writeQueue.then(async () => {
++      await this._ensureLoaded();
++      const staged = new InMemoryIapStore();
++      staged._coinBalances = new Map(this._coinBalances);
++      staged._subscriptions = new Map(this._subscriptions);
++      staged._transactions = new Map(this._transactions);
++      const result = await staged.applyTransaction(provider, externalTransactionId, record, effect);
++      if (result.isNew) {
++        await this._writeSnapshot(staged);
++        this._coinBalances = staged._coinBalances;
++        this._subscriptions = staged._subscriptions;
++        this._transactions = staged._transactions;
++      }
++      return result;
++    });
++    // A failed write must not poison retries or consume an idempotency key.
++    this._writeQueue = operation.catch(() => {});
++    return operation;
++  }
++
+   async recordTransaction(provider, externalTransactionId, record) {
+     await this._ensureLoaded();
+     const result = await super.recordTransaction(
+@@ -143,48 +192,40 @@ export class JsonFileIapStore extends InMemoryIapStore {
+   }
+ 
+   async _ensureLoaded() {
+-    if (this._loaded) {
+-      return;
+-    }
+-    this._loaded = true;
+-    await fs.mkdir(path.dirname(this._filePath), { recursive: true });
+-    try {
+-      const raw = await fs.readFile(this._filePath, "utf8");
+-      if (!raw.trim()) {
+-        return;
+-      }
+-      const parsed = JSON.parse(raw);
+-      hydrateSeed(this, parsed);
+-    } catch (error) {
+-      if (error && error.code === "ENOENT") {
+-        return;
+-      }
+-      throw error;
++    if (!this._loadPromise) {
++      this._loadPromise = (async () => {
++        await fs.mkdir(path.dirname(this._filePath), { recursive: true });
++        try {
++          const raw = await fs.readFile(this._filePath, "utf8");
++          if (raw.trim()) hydrateSeed(this, JSON.parse(raw));
++        } catch (error) {
++          if (error?.code !== "ENOENT") throw error;
++        }
++      })().catch((error) => {
++        this._loadPromise = null;
++        throw error;
++      });
+     }
++    await this._loadPromise;
+   }
+ 
+   async _enqueueWrite() {
+-    this._writeQueue = this._writeQueue.then(async () => {
+-      const serialized = JSON.stringify({
+-        coin_balances: Array.from(this._coinBalances.entries()).map(([k, v]) => ({
+-          key: k,
+-          value: v
+-        })),
+-        subscriptions: Array.from(this._subscriptions.entries()).map(([k, v]) => ({
+-          key: k,
+-          value: v
+-        })),
+-        transactions: Array.from(this._transactions.entries()).map(([k, v]) => ({
+-          key: k,
+-          value: v
+-        }))
+-      });
+-      const tmp = `${this._filePath}.tmp`;
+-      await fs.writeFile(tmp, serialized, "utf8");
+-      await fs.rename(tmp, this._filePath);
++    const operation = this._writeQueue.then(() => this._writeSnapshot(this));
++    this._writeQueue = operation.catch(() => {});
++    await operation;
++  }
++
++  async _writeSnapshot(store) {
++    const serialized = JSON.stringify({
++      coin_balances: Array.from(store._coinBalances.entries()).map(([key, value]) => ({ key, value })),
++      subscriptions: Array.from(store._subscriptions.entries()).map(([key, value]) => ({ key, value })),
++      transactions: Array.from(store._transactions.entries()).map(([key, value]) => ({ key, value }))
+     });
+-    await this._writeQueue;
++    const tmp = `${this._filePath}.tmp`;
++    await fs.writeFile(tmp, serialized, "utf8");
++    await fs.rename(tmp, this._filePath);
+   }
++
+ }
+ 
+ function hydrateSeed(store, seed) {
+diff --git a/services/iap-service/src/store/postgresIapStore.js b/services/iap-service/src/store/postgresIapStore.js
+index 248c42b..34f4f1b 100644
+--- a/services/iap-service/src/store/postgresIapStore.js
++++ b/services/iap-service/src/store/postgresIapStore.js
+@@ -1,8 +1,10 @@
++import { validateTransactionEffect } from "./transactionEffect.js";
++
+ export class PostgresIapStore {
+   constructor(options = {}) {
+     this._pool = options.pool;
+-    if (!this._pool || typeof this._pool.query !== "function") {
+-      throw new Error("PostgresIapStore requires pool.query");
++    if (!this._pool || typeof this._pool.query !== "function" || typeof this._pool.connect !== "function") {
++      throw new Error("PostgresIapStore requires pool.query and pool.connect");
+     }
+   }
+ 
+@@ -41,7 +43,56 @@ export class PostgresIapStore {
+     `);
+   }
+ 
++  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
++    validateTransactionEffect(record, effect);
++    const client = await this._pool.connect();
++    let began = false;
++    let releaseError;
++    try {
++      await client.query("BEGIN");
++      began = true;
++      const result = await this._recordTransaction(client, provider, externalTransactionId, record);
++      if (result.isNew && effect.coins) {
++        const params = [normalize(record.profileId), normalize(effect.coins.gameId), effect.coins.delta];
++        await client.query(
++          `INSERT INTO iap_coin_balances (profile_id, game_id, balance)
++           VALUES ($1, $2, 0) ON CONFLICT (profile_id, game_id) DO NOTHING`,
++          params.slice(0, 2)
++        );
++        // UPDATE locks the wallet row and rechecks this predicate after waiting
++        // for another debit. There is no separate read/check or balance clamp.
++        const updated = await client.query(
++          `UPDATE iap_coin_balances SET balance = balance + $3, updated_at = NOW()
++           WHERE profile_id = $1 AND game_id = $2
++             AND balance::bigint + $3::bigint >= 0
++           RETURNING balance`,
++          params
++        );
++        if (updated.rows.length === 0) throw new Error("insufficient coins");
++      } else if (result.isNew && effect.subscription) {
++        await this._writeSubscription(client, record.profileId, effect.subscription);
++      }
++      await client.query("COMMIT");
++      return result;
++    } catch (error) {
++      if (began) {
++        try { await client.query("ROLLBACK"); } catch (rollbackError) {
++          releaseError = rollbackError;
++        }
++      } else {
++        releaseError = error;
++      }
++      throw error;
++    } finally {
++      client.release(releaseError);
++    }
++  }
++
+   async recordTransaction(provider, externalTransactionId, record) {
++    return this._recordTransaction(this._pool, provider, externalTransactionId, record);
++  }
++
++  async _recordTransaction(executor, provider, externalTransactionId, record) {
+     const sql = `
+       INSERT INTO iap_transactions (provider, external_transaction_id, profile_id, type, product_id, raw)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+@@ -56,11 +107,11 @@ export class PostgresIapStore {
+       normalize(record?.productId),
+       JSON.stringify(record || {})
+     ];
+-    const inserted = await this._pool.query(sql, params);
++    const inserted = await executor.query(sql, params);
+     if (inserted.rows.length > 0) {
+       return { isNew: true, record: inserted.rows[0].raw };
+     }
+-    const existing = await this._pool.query(
++    const existing = await executor.query(
+       `SELECT raw FROM iap_transactions WHERE provider = $1 AND external_transaction_id = $2 LIMIT 1`,
+       [normalize(provider), normalize(externalTransactionId)]
+     );
+@@ -121,8 +172,13 @@ export class PostgresIapStore {
+   }
+ 
+   async upsertSubscription(profileId, subscription) {
++    await this._writeSubscription(this._pool, profileId, subscription);
++    return this.getSubscription(profileId);
++  }
++
++  async _writeSubscription(executor, profileId, subscription) {
+     const expiresAt = Number(subscription?.expiresAt);
+-    await this._pool.query(
++    await executor.query(
+       `
+       INSERT INTO iap_subscriptions (profile_id, provider, external_subscription_id, status, active, expires_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+@@ -145,7 +201,6 @@ export class PostgresIapStore {
+           : null
+       ]
+     );
+-    return this.getSubscription(profileId);
+   }
+ 
+   async mergeProfiles(primaryProfileId, secondaryProfileId) {
+diff --git a/services/iap-service/src/store/transactionEffect.js b/services/iap-service/src/store/transactionEffect.js
+new file mode 100644
+index 0000000..b151ce2
+--- /dev/null
++++ b/services/iap-service/src/store/transactionEffect.js
+@@ -0,0 +1,12 @@
++// Keep memory/file behavior aligned with PostgreSQL INT wallet columns.
++export function validateTransactionEffect(record, effect) {
++  if (!String(record?.profileId || "").trim()) throw new Error("profileId is required");
++  if (effect.coins && effect.subscription) throw new Error("only one transaction benefit is allowed");
++  if (effect.coins) {
++    const { gameId, delta } = effect.coins;
++    if (!String(gameId || "").trim()) throw new Error("gameId is required");
++    if (!Number.isInteger(delta) || delta < -2147483648 || delta > 2147483647) {
++      throw new Error("coin delta must be a supported integer");
++    }
++  }
++}
+diff --git a/test/iap-atomicity.test.js b/test/iap-atomicity.test.js
+new file mode 100644
+index 0000000..7f91645
+--- /dev/null
++++ b/test/iap-atomicity.test.js
+@@ -0,0 +1,130 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { createIapService, InMemoryIapStore, JsonFileIapStore } from "../services/iap-service/index.js";
++
++const providerRegistry = {
++  async verifyPurchase({ provider, catalogEntry, payload }) {
++    return { provider, externalTransactionId: payload.transaction_id, type: "consumable", gameId: catalogEntry.gameId, coinsDelta: catalogEntry.coins };
++  }
++};
++const purchase = (service, id = "purchase") => service.verifyPurchase({ profileId: "player", provider: "google", productId: "coins_500_lumarush", exportTarget: "android", payload: { transaction_id: id } });
++const adjust = (service, delta, key) => service.adjustCoins({ profileId: "player", gameId: "lumarush", delta, idempotencyKey: key });
++
++for (const kind of ["memory", "file"]) {
++  describe(`atomic ${kind} IAP operations`, () => {
++    async function withStore(run) {
++      const dir = kind === "file" ? await fs.mkdtemp(path.join(os.tmpdir(), "iap-atomic-")) : null;
++      const filePath = dir ? path.join(dir, "wallet.json") : null;
++      const store = dir ? new JsonFileIapStore({ filePath }) : new InMemoryIapStore();
++      try { await run(store, createIapService({ store, providerRegistry }), filePath); }
++      finally { if (dir) await fs.rm(dir, { recursive: true, force: true }); }
++    }
++
++    it("concurrent duplicate purchases grant exactly once", () => withStore(async (store, service, filePath) => {
++      // Legacy two-step operations must never be called by the service.
++      store.recordTransaction = store.addCoins = () => { throw new Error("non-atomic path"); };
++      const results = await Promise.all(Array.from({ length: 20 }, () => purchase(service)));
++      assert.equal(results.filter((row) => !row.deduplicated).length, 1);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 500);
++      if (filePath) assert.equal((await new JsonFileIapStore({ filePath }).getCoins("player")).lumarush.balance, 500);
++    }));
++
++    it("rejects overspend without consuming its success key; funded retry works", () => withStore(async (store, service) => {
++      await assert.rejects(adjust(service, -60, "spend"), /insufficient coins/);
++      await adjust(service, 100, "fund");
++      assert.equal((await adjust(service, -60, "spend")).deduplicated, false);
++      assert.equal((await adjust(service, -60, "spend")).deduplicated, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 40);
++    }));
++
++    it("serializes distinct and duplicate concurrent spends without overspending", () => withStore(async (store, service) => {
++      await adjust(service, 100, "fund");
++      const duplicate = await Promise.all(Array.from({ length: 12 }, () => adjust(service, -10, "same-spend")));
++      assert.equal(duplicate.filter((row) => !row.deduplicated).length, 1);
++      const results = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => adjust(service, -10, `spend-${i}`)));
++      assert.equal(results.filter((row) => row.status === "fulfilled").length, 9);
++      assert.equal(results.filter((row) => row.status === "rejected" && /insufficient coins/.test(row.reason.message)).length, 11);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 0);
++    }));
++
++    it("input/grant validation failure does not consume transaction keys", () => withStore(async (store) => {
++      const record = { profileId: "player", type: "consumable" };
++      await assert.rejects(store.applyTransaction("google", "invalid-grant", record, { coins: { gameId: "lumarush", delta: Infinity } }), /coin delta/);
++      assert.equal((await store.applyTransaction("google", "invalid-grant", record, { coins: { gameId: "lumarush", delta: 50 } })).isNew, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 50);
++    }));
++
++    it("balance overflow rolls back the grant and leaves its key retryable", () => withStore(async (store, service) => {
++      await adjust(service, 2147483647, "maximum");
++      await assert.rejects(adjust(service, 1, "overflow"), /balance exceeds/);
++      await adjust(service, -1, "make-room");
++      assert.equal((await adjust(service, 1, "overflow")).deduplicated, false);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 2147483647);
++    }));
++
++    it("response-read failure after commit can be retried without a second grant", () => withStore(async (store, service) => {
++      const read = store.getCoins.bind(store);
++      let fail = true;
++      store.getCoins = async (...args) => {
++        if (fail) { fail = false; throw new Error("response read failed"); }
++        return read(...args);
++      };
++      await assert.rejects(purchase(service), /response read failed/);
++      assert.equal((await purchase(service)).deduplicated, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 500);
++    }));
++  });
++}
++
++describe("file IAP persistence faults", () => {
++  it("does not publish an uncommitted debit while persistence is pending", async () => {
++    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "iap-file-pending-"));
++    const store = new JsonFileIapStore({ filePath: path.join(dir, "wallet.json") });
++    const service = createIapService({ store, providerRegistry });
++    let allowWrite;
++    const gate = new Promise((resolve) => { allowWrite = resolve; });
++    let writeStarted;
++    const started = new Promise((resolve) => { writeStarted = resolve; });
++    try {
++      await adjust(service, 100, "fund");
++      const snapshot = store._writeSnapshot.bind(store);
++      store._writeSnapshot = async (staged) => {
++        writeStarted();
++        await gate;
++        return snapshot(staged);
++      };
++      const first = adjust(service, -40, "spend");
++      await started;
++      assert.equal((await store.getCoins("player")).lumarush.balance, 100);
++      const duplicate = adjust(service, -40, "spend");
++      allowWrite();
++      assert.equal((await first).deduplicated, false);
++      assert.equal((await duplicate).deduplicated, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 60);
++    } finally {
++      allowWrite();
++      await fs.rm(dir, { recursive: true, force: true });
++    }
++  });
++  it("failed snapshot leaves disk, in-memory balance and success key unchanged; retry recovers", async () => {
++    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "iap-file-fault-"));
++    const filePath = path.join(dir, "wallet.json");
++    const store = new JsonFileIapStore({ filePath });
++    const service = createIapService({ store, providerRegistry });
++    try {
++      await adjust(service, 100, "fund");
++      const snapshot = store._writeSnapshot.bind(store);
++      store._writeSnapshot = async () => { throw new Error("disk write failed"); };
++      await assert.rejects(adjust(service, -40, "spend"), /disk write failed/);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 100);
++      assert.equal((await new JsonFileIapStore({ filePath }).getCoins("player")).lumarush.balance, 100);
++      store._writeSnapshot = snapshot;
++      assert.equal((await adjust(service, -40, "spend")).deduplicated, false);
++      assert.equal((await adjust(service, -40, "spend")).deduplicated, true);
++      assert.equal((await new JsonFileIapStore({ filePath }).getCoins("player")).lumarush.balance, 60);
++    } finally { await fs.rm(dir, { recursive: true, force: true }); }
++  });
++});
+diff --git a/test/postgres-iap-atomicity.test.js b/test/postgres-iap-atomicity.test.js
+new file mode 100644
+index 0000000..c5886cc
+--- /dev/null
++++ b/test/postgres-iap-atomicity.test.js
+@@ -0,0 +1,106 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { PostgresIapStore } from "../services/iap-service/index.js";
++
++// Scripted client tests validate SQL/control flow, not real PostgreSQL locking.
++function scriptedStore(steps, { connectError } = {}) {
++  const events = [];
++  const releases = [];
++  const client = {
++    async query(sql, params) {
++      const normalized = sql.replace(/\s+/g, " ").trim();
++      events.push(normalized);
++      const step = steps.shift();
++      assert.ok(step, `unexpected SQL: ${normalized}`);
++      assert.match(normalized, step.sql);
++      step.check?.(params, normalized);
++      if (step.error) throw step.error;
++      return { rows: step.rows || [] };
++    },
++    release(error) { releases.push(error); }
++  };
++  const pool = {
++    async query() { throw new Error("pool.query used inside transaction"); },
++    async connect() { if (connectError) throw connectError; return client; }
++  };
++  return { store: new PostgresIapStore({ pool }), events, releases, steps };
++}
++const record = { profileId: "player", type: "consumable", productId: "coins" };
++const effect = { coins: { gameId: "lumarush", delta: 50 } };
++const insert = { sql: /INSERT INTO iap_transactions/, rows: [{ raw: record }] };
++const wallet = { sql: /INSERT INTO iap_coin_balances/ };
++const update = { sql: /UPDATE iap_coin_balances.*balance::bigint \+ \$3::bigint >= 0.*RETURNING balance/, rows: [{ balance: 50 }] };
++const begin = { sql: /^BEGIN$/ };
++const commit = { sql: /^COMMIT$/ };
++const rollback = { sql: /^ROLLBACK$/ };
++
++describe("Postgres IAP pinned-client transactions (mocked)", () => {
++  it("inserts dedupe and grants on one client before commit/release", async () => {
++    const fixture = scriptedStore([begin, insert, wallet, { ...update, check(params) { assert.deepEqual(params, ["player", "lumarush", 50]); } }, commit]);
++    assert.equal((await fixture.store.applyTransaction("google", "tx", record, effect)).isNew, true);
++    assert.deepEqual(fixture.releases, [undefined]);
++    assert.equal(fixture.steps.length, 0);
++  });
++
++  it("deduplicated retry reads existing record on pinned client and skips grant", async () => {
++    const fixture = scriptedStore([begin, { sql: /INSERT INTO iap_transactions/ }, { sql: /SELECT raw FROM iap_transactions/, rows: [{ raw: record }] }, commit]);
++    const result = await fixture.store.applyTransaction("google", "tx", record, effect);
++    assert.equal(result.isNew, false);
++    assert.deepEqual(result.record, record);
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++
++  it("insufficient debit rolls back its inserted success key and releases", async () => {
++    const fixture = scriptedStore([begin, insert, wallet, { ...update, rows: [] }, rollback]);
++    await assert.rejects(fixture.store.applyTransaction("internal_coin_adjust", "spend", record, { coins: { gameId: "lumarush", delta: -60 } }), /insufficient coins/);
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++
++  for (const stage of ["dedupe", "wallet", "grant", "commit"]) {
++    it(`rolls back/releases on ${stage} failure`, async () => {
++      const failure = new Error(`${stage} failure`);
++      const sequence = [begin, insert, wallet, update, commit];
++      const index = { dedupe: 1, wallet: 2, grant: 3, commit: 4 }[stage];
++      const steps = sequence.slice(0, index + 1).map((step, i) => i === index ? { ...step, error: failure } : step);
++      const fixture = scriptedStore([...steps, rollback]);
++      await assert.rejects(fixture.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++      assert.equal(fixture.steps.length, 0);
++      assert.deepEqual(fixture.releases, [undefined]);
++    });
++  }
++
++  it("preserves original error and discards client if rollback fails", async () => {
++    const failure = new Error("grant failure");
++    const rollbackFailure = new Error("connection lost during rollback");
++    const fixture = scriptedStore([begin, insert, wallet, { ...update, error: failure }, { ...rollback, error: rollbackFailure }]);
++    await assert.rejects(fixture.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++    assert.deepEqual(fixture.releases, [rollbackFailure]);
++  });
++
++  it("releases a client when BEGIN fails and handles acquisition failure", async () => {
++    const failure = new Error("begin failure");
++    const fixture = scriptedStore([{ ...begin, error: failure }]);
++    await assert.rejects(fixture.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++    assert.deepEqual(fixture.releases, [failure]);
++    const unavailable = scriptedStore([], { connectError: failure });
++    await assert.rejects(unavailable.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++    assert.equal(unavailable.releases.length, 0);
++  });
++
++  it("rolls back dedupe when the existing subscription write fails", async () => {
++    const failure = new Error("subscription write failure");
++    const fixture = scriptedStore([begin, insert, { sql: /INSERT INTO iap_subscriptions/, error: failure }, rollback]);
++    await assert.rejects(fixture.store.applyTransaction("apple", "sub", record, { subscription: { active: true } }), (error) => error === failure);
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++
++  it("keeps the existing subscription write inside the same transaction", async () => {
++    const fixture = scriptedStore([begin, insert, { sql: /INSERT INTO iap_subscriptions/ }, commit]);
++    await fixture.store.applyTransaction("apple", "sub", record, { subscription: { active: true, status: "active" } });
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++});
+diff --git a/test/postgres-iap-integration.test.js b/test/postgres-iap-integration.test.js
+new file mode 100644
+index 0000000..c92b384
+--- /dev/null
++++ b/test/postgres-iap-integration.test.js
+@@ -0,0 +1,68 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { createIapService, PostgresIapStore } from "../services/iap-service/index.js";
++
++// Opt-in only: never use DATABASE_URL or a remote host. Requires an existing
++// local PostgreSQL server and npm-installed pg. Creates/drops one isolated schema.
++it("real local PostgreSQL: atomic grants, failed-debit retries and concurrent spends", {
++  skip: !process.env.IAP_TEST_LOCAL_DATABASE_URL,
++  timeout: 30_000
++}, async () => {
++  const url = new URL(process.env.IAP_TEST_LOCAL_DATABASE_URL);
++  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
++  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "integration DB must be loopback");
++  assert.equal(url.search, "", "connection-string query overrides are not allowed");
++  const { default: pg } = await import("pg");
++  const schema = `iap_atomic_test_${process.pid}_${Date.now()}`;
++  const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
++  let pool;
++  let created = false;
++  try {
++    await admin.query(`CREATE SCHEMA ${schema}`);
++    created = true;
++    pool = new pg.Pool({ connectionString: url.toString(), options: `-c search_path=${schema}`, max: 8, connectionTimeoutMillis: 3000 });
++    const store = new PostgresIapStore({ pool });
++    await store.init();
++    const service = createIapService({ store, providerRegistry: {
++      async verifyPurchase({ provider, catalogEntry, payload }) {
++        return { provider, externalTransactionId: payload.transaction_id, type: "consumable", gameId: catalogEntry.gameId, coinsDelta: catalogEntry.coins };
++      }
++    } });
++    const buy = (id, profileId = "buyer") => service.verifyPurchase({ profileId, provider: "google", productId: "coins_500_lumarush", exportTarget: "android", payload: { transaction_id: id } });
++    const adjust = (delta, key) => service.adjustCoins({ profileId: "spender", gameId: "lumarush", delta, idempotencyKey: key });
++
++    // Raise after the dedupe INSERT, during the grant, using a real DB trigger.
++    await pool.query(`CREATE FUNCTION reject_grant() RETURNS trigger LANGUAGE plpgsql AS $$
++      BEGIN RAISE EXCEPTION 'injected wallet grant failure'; END $$`);
++    await pool.query(`CREATE TRIGGER reject_grant BEFORE UPDATE ON iap_coin_balances
++      FOR EACH ROW EXECUTE FUNCTION reject_grant()`);
++    await assert.rejects(buy("faulted-purchase", "faulted-buyer"), /injected wallet grant failure/);
++    assert.deepEqual(await store.getCoins("faulted-buyer"), {});
++    assert.equal((await pool.query("SELECT COUNT(*)::int AS n FROM iap_transactions")).rows[0].n, 0);
++    await pool.query("DROP TRIGGER reject_grant ON iap_coin_balances");
++    assert.equal((await buy("faulted-purchase", "faulted-buyer")).deduplicated, false);
++    assert.equal((await buy("faulted-purchase", "faulted-buyer")).deduplicated, true);
++    assert.equal((await store.getCoins("faulted-buyer")).lumarush.balance, 500);
++
++    const purchases = await Promise.all(Array.from({ length: 20 }, () => buy("same-purchase")));
++    assert.equal(purchases.filter((result) => !result.deduplicated).length, 1);
++    assert.equal((await store.getCoins("buyer")).lumarush.balance, 500);
++
++    await assert.rejects(adjust(-10, "initially-unfunded"), /insufficient coins/);
++    await adjust(100, "fund");
++    assert.equal((await adjust(-10, "initially-unfunded")).deduplicated, false);
++    assert.equal((await adjust(-10, "initially-unfunded")).deduplicated, true);
++    const spends = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => adjust(-10, `spend-${i}`)));
++    assert.equal(spends.filter((result) => result.status === "fulfilled").length, 9);
++    assert.equal(spends.filter((result) => result.status === "rejected" && /insufficient coins/.test(result.reason.message)).length, 11);
++    assert.equal((await store.getCoins("spender")).lumarush.balance, 0);
++    const failed = spends.findIndex((result) => result.status === "rejected");
++    await adjust(10, "refill");
++    assert.equal((await adjust(-10, `spend-${failed}`)).deduplicated, false);
++    assert.equal((await store.getCoins("spender")).lumarush.balance, 0);
++  } finally {
++    if (pool) await pool.end();
++    try { if (created) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
++    finally { await admin.end(); }
++  }
++});
+-- 
+2.39.3 (Apple Git-145)
+

@@ -1,0 +1,509 @@
+From 29d0f7df3c036a0ead6de327a8c9dc5bb4102138 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:27:34 -0500
+Subject: [PATCH] Require authenticated template exchanges and disable legacy
+ identity proxy
+
+---
+ .github/workflows/identity-exchange-tests.yml | 23 +++++
+ backend/README.md                             | 11 +++
+ backend/server.js                             | 20 +---
+ .../templates/nakama-game-backend/README.md   | 26 +++++
+ .../nakama-game-backend/nakama/README.md      |  6 ++
+ .../nakama-game-backend/nakama/local.yml      |  1 +
+ .../nakama/modules/index.js                   | 31 ++++--
+ .../nakama/render/start.sh                    |  8 ++
+ .../nakama/tests/identity_exchange.test.js    | 54 +++++++++++
+ .../templates/nakama-game-backend/render.yaml |  2 +
+ backend/tests/legacy_identity_proxy.test.cjs  | 21 ++++
+ docs/IDENTITY_EXCHANGE_ROLLOUT.md             | 96 +++++++++++++++++++
+ scripts/README.md                             |  9 ++
+ templates/godot-nakama/README.md              |  6 ++
+ 14 files changed, 291 insertions(+), 23 deletions(-)
+ create mode 100644 .github/workflows/identity-exchange-tests.yml
+ create mode 100644 backend/templates/nakama-game-backend/nakama/tests/identity_exchange.test.js
+ create mode 100644 backend/tests/legacy_identity_proxy.test.cjs
+ create mode 100644 docs/IDENTITY_EXCHANGE_ROLLOUT.md
+
+diff --git a/.github/workflows/identity-exchange-tests.yml b/.github/workflows/identity-exchange-tests.yml
+new file mode 100644
+index 0000000..9f38a7d
+--- /dev/null
++++ b/.github/workflows/identity-exchange-tests.yml
+@@ -0,0 +1,23 @@
++name: Backend Identity Exchange Tests
++on:
++  pull_request:
++    paths:
++      - 'backend/**'
++      - '.github/workflows/identity-exchange-tests.yml'
++  push:
++    branches: ['main']
++    paths:
++      - 'backend/**'
++      - '.github/workflows/identity-exchange-tests.yml'
++permissions:
++  contents: read
++jobs:
++  backend-identity:
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
++      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
++        with:
++          node-version: '20'
++      - run: node --test backend/templates/nakama-game-backend/nakama/tests/*.test.js backend/tests/*.test.cjs
++      - run: sh -n backend/templates/nakama-game-backend/nakama/render/start.sh
+diff --git a/backend/README.md b/backend/README.md
+index eda4669..d6a2d21 100644
+--- a/backend/README.md
++++ b/backend/README.md
+@@ -28,3 +28,14 @@ For per-title Nakama backend repos, use:
+ 
+ This includes local Docker, Render runtime files, proxy startup scripts, and
+ the shared RPC bridge module.
++
++## Legacy identity proxy disabled
++
++The standalone server.js demo's guest/email flows do not establish authenticated
++Nakama ctx.userId. Its platform exchange helper now returns 503 without network
++I/O, even if a backend credential is present in the process environment. Do not
++attach a platform exchange credential to this demo. Use the authenticated Nakama
++backend template, coordinate gateway PR7 and existing callers, and configure
++approved per-game/environment credentials separately. This change does not make
++the demo email delivery stub production-ready. Other legacy demo routes remain
++outside this identity patch.
+diff --git a/backend/server.js b/backend/server.js
+index 76eb467..3a73b51 100644
+--- a/backend/server.js
++++ b/backend/server.js
+@@ -181,22 +181,10 @@ class HttpError extends Error {
+   }
+ }
+ 
+-async function exchangeWithIdentity(payload) {
+-  const response = await fetch(`${config.identityGatewayUrl}/v1/auth/nakama`, {
+-    method: "POST",
+-    headers: {
+-      "content-type": "application/json"
+-    },
+-    body: JSON.stringify(payload)
+-  });
+-  const json = await response.json().catch(() => ({}));
+-  if (!response.ok) {
+-    throw new HttpError(
+-      502,
+-      json?.error?.message || "identity exchange failed"
+-    );
+-  }
+-  return json;
++async function exchangeWithIdentity(_payload) {
++  // Guest device IDs and the email-code demo are not authenticated Nakama
++  // identities. Never attach a backend exchange credential to this proxy.
++  throw new HttpError(503, "Legacy identity proxy disabled; use authenticated Nakama exchange");
+ }
+ 
+ function generateCode() {
+diff --git a/backend/templates/nakama-game-backend/README.md b/backend/templates/nakama-game-backend/README.md
+index 952735b..7f28a85 100644
+--- a/backend/templates/nakama-game-backend/README.md
++++ b/backend/templates/nakama-game-backend/README.md
+@@ -59,3 +59,29 @@ This template uses the following placeholders:
+ - `backend/nakama/.env.cloudrun.generated` (GitHub environment variable scaffold for Cloud Run workflow inputs)
+ - `backend/nakama/.env.local.generated` (local runtime defaults)
+ - `backend/nakama/.env.render.generated` (Render fallback env scaffold)
++
++## Authenticated platform identity exchange
++
++The template RPC and internal exchange helper require authenticated nonblank
++`ctx.userId`; client payloads cannot select the user, game or exchange credential.
++The server uses `GAME_ID` and a dedicated `TPX_NAKAMA_EXCHANGE_KEY` matching that
++game/environment's gateway mapping. Only identity requests receive
++`x-nakama-exchange-key`. Missing/invalid configuration fails before HTTP. Use at
++least 32 URL-safe characters for an approved server credential; no value is
++provided and no provisioning is performed. Never use PLATFORM_INTERNAL_KEY as a
++fallback or export this value in Godot/client configuration.
++
++Render's blueprint declares a server-only unsynced setting, and start.sh forwards
++it into Nakama runtime.env. Cloud Run requires a separately approved secret-backed
++environment reference. Local Compose mounts local.yml directly; use a private
++runtime-config override and avoid its traced (-ecx) command for secrets. Generated
++onboarding env files do not provision this key; inject it through approved secret
++management, not source manifests. Existing generated repos do not inherit these
++changes automatically. See docs/IDENTITY_EXCHANGE_ROLLOUT.md in the canonical repo.
++
++No new template tokens are introduced; bootstrap-game.ps1 retains token ownership.
++The NakamaService/ShopModal/ThemeManager sibling interfaces were inspected and
++require no identity RPC/client contract change. PowerShell is unavailable on this
++Mac, so the normal audit_repo.ps1, bootstrap-game.ps1 and verify_repo.ps1 workflows
++were not run. Node tests perform limited token-substitution/runtime selection
++checks, not a claim that full Godot/bootstrap verification passed.
+diff --git a/backend/templates/nakama-game-backend/nakama/README.md b/backend/templates/nakama-game-backend/nakama/README.md
+index 71721ff..64ffbb6 100644
+--- a/backend/templates/nakama-game-backend/nakama/README.md
++++ b/backend/templates/nakama-game-backend/nakama/README.md
+@@ -16,3 +16,9 @@ Render deployment:
+ - Uses `backend/nakama/Dockerfile.render`
+ - Uses root `render.yaml`
+ - `render/start.sh` runs migrations, starts Nakama, and reverse proxies console under `/console/`.
++
++Identity exchange requires server runtime.env TPX_NAKAMA_EXCHANGE_KEY matching
++the gateway's game/environment mapping. It is sent only as x-nakama-exchange-key;
++missing configuration fails closed. Never substitute PLATFORM_INTERNAL_KEY or
++put this value in client exports/manifests. Approved provisioning is separate.
++See backend/README.md and canonical docs/IDENTITY_EXCHANGE_ROLLOUT.md for rollout.
+diff --git a/backend/templates/nakama-game-backend/nakama/local.yml b/backend/templates/nakama-game-backend/nakama/local.yml
+index dfee8ce..01c8e08 100644
+--- a/backend/templates/nakama-game-backend/nakama/local.yml
++++ b/backend/templates/nakama-game-backend/nakama/local.yml
+@@ -20,6 +20,7 @@ runtime:
+   js_entrypoint: "index.js"
+   env:
+     - "GAME_ID=__GAME_ID__"
++    - "TPX_NAKAMA_EXCHANGE_KEY="
+     - "LEADERBOARD_ID=__LEADERBOARD_ID__"
+     - "PLATFORM_IDENTITY_URL=http://host.docker.internal:8080"
+     - "PLATFORM_ACCOUNT_MAGIC_LINK_START_URL=http://host.docker.internal:8080/v1/account/magic-link/start"
+diff --git a/backend/templates/nakama-game-backend/nakama/modules/index.js b/backend/templates/nakama-game-backend/nakama/modules/index.js
+index 4b5209b..32725e9 100644
+--- a/backend/templates/nakama-game-backend/nakama/modules/index.js
++++ b/backend/templates/nakama-game-backend/nakama/modules/index.js
+@@ -18,6 +18,7 @@ var MODULE_CONFIG = {
+   gameId: "",
+   leaderboardId: "",
+   platformIdentityUrl: "",
++  nakamaExchangeKey: "",
+   platformUsernameValidateUrl: "",
+   platformAccountMagicLinkStartUrl: "",
+   platformAccountMagicLinkCompleteUrl: "",
+@@ -56,6 +57,7 @@ function loadConfig(ctx) {
+     gameId: gameId,
+     leaderboardId: String(env.LEADERBOARD_ID || (gameId + "_high_scores")).trim().toLowerCase(),
+     platformIdentityUrl: String(env.PLATFORM_IDENTITY_URL || "").trim(),
++    nakamaExchangeKey: String(env.TPX_NAKAMA_EXCHANGE_KEY || ""),
+     platformUsernameValidateUrl: String(env.PLATFORM_USERNAME_VALIDATE_URL || "").trim(),
+     platformAccountMagicLinkStartUrl: String(
+       env.PLATFORM_ACCOUNT_MAGIC_LINK_START_URL || env.TPX_PLATFORM_MAGIC_LINK_START_URL || ""
+@@ -86,8 +88,12 @@ function loadConfig(ctx) {
+ }
+ 
+ function rpcPlatformAuthExchange(ctx, logger, nk, payload) {
++  assertAuthenticated(ctx);
++  if (typeof ctx.userId !== "string" || !ctx.userId.trim()) {
++    throw new Error("User session is required.");
++  }
+   var data = parsePayload(payload);
+-  var nakamaUserId = String(data.nakama_user_id || ctx.userId || "").trim();
++  var nakamaUserId = String(ctx.userId).trim();
+   if (!nakamaUserId) {
+     throw new Error("nakama_user_id is required");
+   }
+@@ -97,9 +103,7 @@ function rpcPlatformAuthExchange(ctx, logger, nk, payload) {
+   var response = nk.httpRequest(
+     MODULE_CONFIG.platformIdentityUrl + "/v1/auth/nakama",
+     "post",
+-    {
+-      "Content-Type": "application/json",
+-    },
++    nakamaExchangeHeaders(),
+     JSON.stringify({
+       game_id: MODULE_CONFIG.gameId,
+       nakama_user_id: nakamaUserId,
+@@ -489,15 +493,17 @@ function rpcClientEventTrack(ctx, logger, nk, payload) {
+ }
+ 
+ function exchangePlatformSession(ctx, nk) {
++  assertAuthenticated(ctx);
++  if (typeof ctx.userId !== "string" || !ctx.userId.trim()) {
++    throw new Error("User session is required.");
++  }
+   if (!MODULE_CONFIG.platformIdentityUrl) {
+     throw new Error("PLATFORM_IDENTITY_URL is required");
+   }
+   var response = nk.httpRequest(
+     MODULE_CONFIG.platformIdentityUrl + "/v1/auth/nakama",
+     "post",
+-    {
+-      "Content-Type": "application/json"
+-    },
++    nakamaExchangeHeaders(),
+     JSON.stringify({
+       game_id: MODULE_CONFIG.gameId,
+       nakama_user_id: String((ctx && ctx.userId) || "").trim(),
+@@ -1299,3 +1305,14 @@ function trimReplayEntries(entries, maxEntries) {
+   }
+   return out;
+ }
++
++function nakamaExchangeHeaders() {
++  if (!String(MODULE_CONFIG.gameId || "").trim()) {
++    throw new Error("server game ID is required for identity exchange");
++  }
++  var key = MODULE_CONFIG.nakamaExchangeKey;
++  if (typeof key !== "string" || key.length < 32 || !/^[A-Za-z0-9_-]+$/.test(key)) {
++    throw new Error("TPX_NAKAMA_EXCHANGE_KEY is not configured correctly");
++  }
++  return { "Content-Type": "application/json", "x-nakama-exchange-key": key };
++}
+diff --git a/backend/templates/nakama-game-backend/nakama/render/start.sh b/backend/templates/nakama-game-backend/nakama/render/start.sh
+index 6b8a908..dea7951 100644
+--- a/backend/templates/nakama-game-backend/nakama/render/start.sh
++++ b/backend/templates/nakama-game-backend/nakama/render/start.sh
+@@ -24,6 +24,13 @@ LEADERBOARD_ID_VALUE="${LEADERBOARD_ID:-${GAME_ID}_high_scores}"
+ NAKAMA_SOCKET_PORT="${NAKAMA_SOCKET_PORT:-7354}"
+ NAKAMA_CONSOLE_PORT="${NAKAMA_CONSOLE_PORT:-7355}"
+ 
++NAKAMA_EXCHANGE_KEY_VALUE="${TPX_NAKAMA_EXCHANGE_KEY:-}"
++case "$NAKAMA_EXCHANGE_KEY_VALUE" in
++  *[!A-Za-z0-9_-]*) echo "TPX_NAKAMA_EXCHANGE_KEY has an invalid format"; exit 1 ;;
++esac
++umask 077
++touch /tmp/render-local.yml
++chmod 600 /tmp/render-local.yml
+ cat > /tmp/render-local.yml <<EOF
+ name: "${GAME_ID}-nakama"
+ logger:
+@@ -48,6 +55,7 @@ runtime:
+     - "GAME_ID=${GAME_ID}"
+     - "LEADERBOARD_ID=${LEADERBOARD_ID_VALUE}"
+     - "PLATFORM_IDENTITY_URL=${PLATFORM_IDENTITY_URL:-}"
++    - "TPX_NAKAMA_EXCHANGE_KEY=${NAKAMA_EXCHANGE_KEY_VALUE}"
+     - "PLATFORM_USERNAME_VALIDATE_URL=${PLATFORM_USERNAME_VALIDATE_URL:-}"
+     - "PLATFORM_ACCOUNT_MAGIC_LINK_START_URL=${PLATFORM_ACCOUNT_MAGIC_LINK_START_URL:-}"
+     - "PLATFORM_ACCOUNT_MAGIC_LINK_COMPLETE_URL=${PLATFORM_ACCOUNT_MAGIC_LINK_COMPLETE_URL:-}"
+diff --git a/backend/templates/nakama-game-backend/nakama/tests/identity_exchange.test.js b/backend/templates/nakama-game-backend/nakama/tests/identity_exchange.test.js
+new file mode 100644
+index 0000000..1a8b903
+--- /dev/null
++++ b/backend/templates/nakama-game-backend/nakama/tests/identity_exchange.test.js
+@@ -0,0 +1,54 @@
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++const key = "test-only-game-backend-key-at-least-32-bytes";
++function load(envOverrides = {}) {
++  const context = vm.createContext({});
++  vm.runInContext(fs.readFileSync(path.join(__dirname, "../modules/index.js"), "utf8"), context);
++  context.MODULE_CONFIG = context.loadConfig({ env: { GAME_ID: "fixture_game", PLATFORM_IDENTITY_URL: "https://identity.test", TPX_NAKAMA_EXCHANGE_KEY: key, ...envOverrides } });
++  const calls = [];
++  const nk = { httpRequest(url, method, headers, body) { calls.push({ url, headers, body: JSON.parse(body) }); return { code: 200, body: '{"session_token":"test-session"}' }; } };
++  return { context, calls, nk };
++}
++for (const method of ["rpcPlatformAuthExchange", "exchangePlatformSession"]) {
++  const invoke = (context, nk, ctx, payload = "{}") => method === "rpcPlatformAuthExchange" ? context[method](ctx, {}, nk, payload) : context[method](ctx, nk);
++  test(`${method}: requires authenticated context and dedicated server credential before HTTP`, () => {
++    for (const ctx of [undefined, {}, { userId: " " }, { userId: 42 }]) {
++      const { context, calls, nk } = load();
++      assert.throws(() => invoke(context, nk, ctx), /User session is required/);
++      assert.equal(calls.length, 0);
++    }
++    for (const supplied of ["", "short", "invalid-key\n"]) {
++      const { context, calls, nk } = load({ TPX_NAKAMA_EXCHANGE_KEY: supplied, PLATFORM_INTERNAL_KEY: key });
++      assert.throws(() => invoke(context, nk, { userId: "caller" }), /TPX_NAKAMA_EXCHANGE_KEY/);
++      assert.equal(calls.length, 0);
++    }
++  });
++  test(`${method}: ignores client-selected identity/game/key and uses only server context`, () => {
++    const { context, calls, nk } = load();
++    invoke(context, nk, { userId: "caller", username: "Player", nakama_user_id: "victim", game_id: "other" }, JSON.stringify({ nakama_user_id: "victim", game_id: "other", backendKey: "client-key" }));
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].body.nakama_user_id, "caller");
++    assert.equal(calls[0].body.game_id, "fixture_game");
++    assert.equal(calls[0].headers["x-nakama-exchange-key"], key);
++    assert.equal(calls[0].headers["x-admin-key"], undefined);
++  });
++  test(`${method}: rejects platform authentication failure`, () => {
++    const { context, nk } = load();
++    nk.httpRequest = () => ({ code: 401, body: "{}" });
++    assert.throws(() => invoke(context, nk, { userId: "caller" }), /exchange failed/);
++  });
++}
++test("template runtime selection and token substitution stay game-neutral", () => {
++  for (const file of ["local.yml", "../render.yaml"]) {
++    const raw = fs.readFileSync(path.join(__dirname, "..", file), "utf8");
++    const rendered = raw.replaceAll("__GAME_ID__", "fixture_game").replaceAll("__LEADERBOARD_ID__", "fixture_game_high_scores").replaceAll("__DEFAULT_SERVER_KEY__", "fixture-dev-key");
++    assert.doesNotMatch(rendered, /__[A-Z0-9_]+__/);
++    assert.match(rendered, /TPX_NAKAMA_EXCHANGE_KEY/);
++  }
++  const startup = fs.readFileSync(path.join(__dirname, "../render/start.sh"), "utf8");
++  assert.match(startup, /js_entrypoint: "index\.js"/);
++  assert.match(startup, /TPX_NAKAMA_EXCHANGE_KEY=\$\{NAKAMA_EXCHANGE_KEY_VALUE\}/);
++});
+diff --git a/backend/templates/nakama-game-backend/render.yaml b/backend/templates/nakama-game-backend/render.yaml
+index d07acd0..7cbcef0 100644
+--- a/backend/templates/nakama-game-backend/render.yaml
++++ b/backend/templates/nakama-game-backend/render.yaml
+@@ -19,6 +19,8 @@ services:
+         value: "__LEADERBOARD_ID__"
+       - key: PLATFORM_IDENTITY_URL
+         sync: false
++      - key: TPX_NAKAMA_EXCHANGE_KEY
++        sync: false
+       - key: PLATFORM_ACCOUNT_MAGIC_LINK_START_URL
+         sync: false
+       - key: PLATFORM_ACCOUNT_MAGIC_LINK_COMPLETE_URL
+diff --git a/backend/tests/legacy_identity_proxy.test.cjs b/backend/tests/legacy_identity_proxy.test.cjs
+new file mode 100644
+index 0000000..3b0b15e
+--- /dev/null
++++ b/backend/tests/legacy_identity_proxy.test.cjs
+@@ -0,0 +1,21 @@
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++const crypto = require("node:crypto");
++const { Readable } = require("node:stream");
++test("legacy guest proxy cannot mint a session or forward an exchange credential", async () => {
++  let handler, requests = 0;
++  const source = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8").replace(/^import .*;\n/gm, "");
++  const context = vm.createContext({ http: { createServer(fn) { handler = fn; return { listen() {} }; } }, crypto, process: { env: { TPX_NAKAMA_EXCHANGE_KEY: "test-only-key-must-never-be-forwarded" } }, console, URL, Buffer, fetch() { requests++; throw new Error("unexpected exchange"); } });
++  vm.runInContext(source, context);
++  const req = Readable.from([JSON.stringify({ device_id: "client-selected-device", nakama_user_id: "victim" })]);
++  req.method = "POST"; req.url = "/auth/guest"; req.headers = {};
++  const res = { setHeader() {}, end(body) { this.body = JSON.parse(body); } };
++  await handler(req, res);
++  assert.equal(res.statusCode, 503);
++  assert.match(res.body.error, /Legacy identity proxy disabled/);
++  assert.equal(requests, 0);
++  assert.equal(res.body.session_token, undefined);
++});
+diff --git a/docs/IDENTITY_EXCHANGE_ROLLOUT.md b/docs/IDENTITY_EXCHANGE_ROLLOUT.md
+new file mode 100644
+index 0000000..b53d620
+--- /dev/null
++++ b/docs/IDENTITY_EXCHANGE_ROLLOUT.md
+@@ -0,0 +1,96 @@
++# Identity exchange rollout inventory
++
++Inspected with verified TeraPixelGames access on 2026-10-20. Source-only inventory;
++actual deployed runtimes/exposure are unverified. GitHub indexed searches returned
++68 literal-route matches and 19 configuration-name matches, each with
++incomplete_results=false. Searches can omit unindexed/dynamic callers; this is not
++proof of exhaustive deployed coverage. The active LumaRush module was also read
++locally. No credentials or production identities were used.
++
++## Canonical fixes prepared locally
++
++- ArcadeCore backend/templates/nakama-game-backend/nakama/modules/index.js:
++  both RPC and internal helper now require ctx.userId and dedicated server proof.
++  Runtime entrypoint is index.js; copied consumer modules have the same old blob.
++- ArcadeCore backend/server.js: legacy guest/email proxy disabled with 503;
++  never grant it an exchange key without a genuine authenticated identity design.
++- terapixel-platform templates/nakama-game-backend/nakama/modules/index.js:
++  separate local compatibility-scaffold patch fixes Nakama callback registration,
++  payload-selected IDs and missing game-scoped credential proof. Use canonical
++  ArcadeCore for new scaffolds. This platform patch remains unpublished.
++- LumaRush backend/nakama/modules/lumarush.js is the configured active entrypoint;
++  index.js is an alternative template-derived path. Both are covered by draft
++  https://github.com/Terapixel-Games/LumaRush/pull/13.
++
++## Identical vulnerable generated modules on default branches
++
++All 21 game modules below share the exact Git blob
++4b5209bf5b04e2a25d399fc6ae9f9eba621570d0 with the old canonical template. They prefer
++payload nakama_user_id over ctx.userId and exchange without backend proof.
++The feature-branch fixes are not reflected in these default-branch snapshots.
++
++| Repository | Path | Blob | State |
++|---|---|---|---|
++| AxoRaid | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| bap | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| block_forge | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| CarnivalMarksman | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| ChromaticRunner | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| CloudHopDash | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| color_crunch | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| GloBlocks | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| LumaRush | `backend/nakama/modules/index.js` | `4b5209bf` | Draft PR13; main still old |
++| MiniSudokuRush | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| NeonSwarm | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| PocketFrontline | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| SaucerSkirmish | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| SkyboundLeap | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| SnakeGame | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| SpeedSolitaire | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| StarfallRedux | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| SteelDuel | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| sumslide | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| worm_breaker | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++| wormhole_raiders | `backend/nakama/modules/index.js` | `4b5209bf` | Needs coordinated caller update |
++
++## Distinct variants and additional active paths
++
++- racer/backend/nakama/modules/index.js (b4173814): exchange RPC at line 151
++  still prefers payload-selected ID; internal helper at line 1568 lacks proof.
++  Preserve its product-specific additions when patching, rather than overwriting.
++- GlowPath/backend/nakama/modules/index.js (db178fad): uses ctx.userId, but sends
++  x-admin-key in both paths. Must migrate to the dedicated game key/header;
++  the hardened gateway intentionally has no admin-key fallback.
++- SnakeGame/backend/nakama/modules/snakegame.js (8c44b33e) and
++  color_crunch/backend/nakama/modules/colorcrunch.js (c05ce53f) also exchange from
++  ctx.userId without dedicated proof. Patching their index.js alone is insufficient.
++- LumaRush/backend/nakama/modules/lumarush.js (d3d22f33 on main) is addressed
++  separately in its companion PR; no deployed update is claimed.
++
++## Safe coordination order
++
++1. Review gateway PR7, the LumaRush companion and canonical/scaffold patches.
++2. Inventory actual runtime entrypoints for every affected game; update/test all
++   active and template-derived paths, deriving only authenticated ctx.userId and
++   server GAME_ID. Never grant a key to a payload-trusting proxy.
++3. Review and merge to each repo's main before staging. Main may auto-deploy:
++   platform/LumaRush Cloud Run targets staging; LumaRush Pages also auto-deploys
++   on main. Version tags/manual paths can target production. Avoid uncoordinated
++   merges; no workflow dispatch/tag/deployment is authorized by these patches.
++4. Separately approve/provision distinct per-game/environment credentials and
++   matching gateway mappings. Server/runtime env injection is required; container
++   env alone is not Nakama runtime.env. No credentials are provided here.
++5. Test controlled staging accounts and negative identity/game/key cases, then
++   promote reviewed main revisions to production. Existing callers otherwise
++   receive 401 intentionally. Public web magic links remain available, but game
++   account/wallet flows that depend on exchange can fail until coordinated.
++
++## Verification limits
++
++Node tests cover the canonical RPC/helper boundary and the disabled legacy proxy.
++They do not establish full platform/IAP/leaderboard authorization or production
++readiness. PowerShell and full Godot/bootstrap audit/verification were unavailable;
++no scripts/services were installed or started. Provider credentials, runtime
++settings and deployed game variants were not inspected or changed. The separate
++platform real PostgreSQL tests remain gated on explicit local-cluster approval.
++
+diff --git a/scripts/README.md b/scripts/README.md
+index 24afbde..3845361 100644
+--- a/scripts/README.md
++++ b/scripts/README.md
+@@ -155,3 +155,12 @@ Useful flags:
+ - `-SkipVerify` skip post-bootstrap verifier.
+ - `-SkipUnitTests` skip final unit test step.
+ - `-RunCiChecks` pass CI sanity flag through verifier.
++
++Identity-exchange template security: bootstrap copies the authenticated backend
++RPC and its negative tests. Existing generated repositories require explicit
++backend updates; copying the shared Godot addon alone is insufficient. Provision
++TPX_NAKAMA_EXCHANGE_KEY only through approved server secret management after
++caller review; bootstrap/turnkey commands do not generate or grant exchange keys.
++Do not place credential values in manifests or generated source files. No new
++placeholder tokens were added. See docs/IDENTITY_EXCHANGE_ROLLOUT.md. Full
++PowerShell/Godot verification must be run where those tools are available.
+diff --git a/templates/godot-nakama/README.md b/templates/godot-nakama/README.md
+index 1edd8b1..ec833b1 100644
+--- a/templates/godot-nakama/README.md
++++ b/templates/godot-nakama/README.md
+@@ -100,3 +100,9 @@ This template is the reusable client-side parity slice extracted from LumaRush/C
+    - Audio icon button -> `AudioTrackOverlay` + `MusicManager.set_track(...)`
+    - Results scene: call `claim_run_reward` and optional double-reward flow.
+    - Results scene navigation (`Play Again` and `Main Menu`): call `AdManager.maybe_show_interstitial()` before scene change.
++
++Backend identity exchanges now require authenticated Nakama ctx.userId and a
++server-only TPX_NAKAMA_EXCHANGE_KEY. Client RPC payloads cannot choose platform
++identity. Keep that credential out of Godot exports/settings; no client-side key
++or RPC signature change is required. See the backend template runbook and
++canonical docs/IDENTITY_EXCHANGE_ROLLOUT.md for coordinated rollout prerequisites.
+-- 
+2.39.3 (Apple Git-145)
+

@@ -1,0 +1,313 @@
+From 3ab2993a8b1ea9bff2887b31334d26a7ea7608f3 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 17:18:06 -0500
+Subject: [PATCH] Prepare secret-backed identity rollout wiring and readiness
+ gates
+
+---
+ .github/workflows/cloudrun-nakama-deploy.yml  |  12 +-
+ .../cloudrun/IDENTITY_ROLLOUT_READINESS.md    | 140 ++++++++++++++++++
+ backend/nakama/cloudrun/README.md             |  27 ++++
+ backend/nakama/cloudrun/service.template.yaml |   5 +
+ .../tests/rollout_configuration.test.js       |  35 +++++
+ render.yaml                                   |   2 +
+ 6 files changed, 220 insertions(+), 1 deletion(-)
+ create mode 100644 backend/nakama/cloudrun/IDENTITY_ROLLOUT_READINESS.md
+ create mode 100644 backend/nakama/tests/rollout_configuration.test.js
+
+diff --git a/.github/workflows/cloudrun-nakama-deploy.yml b/.github/workflows/cloudrun-nakama-deploy.yml
+index 3fbc539..ec9b89b 100644
+--- a/.github/workflows/cloudrun-nakama-deploy.yml
++++ b/.github/workflows/cloudrun-nakama-deploy.yml
+@@ -54,6 +54,9 @@ jobs:
+       CLOUDRUN_DEPLOY_FLAGS_JSON: ${{ vars.CLOUDRUN_DEPLOY_FLAGS_JSON }}
+       CLOUDRUN_VPC_CONNECTOR: ${{ vars.CLOUDRUN_VPC_CONNECTOR }}
+       CLOUDRUN_VPC_EGRESS: ${{ vars.CLOUDRUN_VPC_EGRESS }}
++      # Secret resource metadata only; never put the credential in Actions variables.
++      TPX_NAKAMA_EXCHANGE_SECRET: ${{ vars.TPX_NAKAMA_EXCHANGE_SECRET }}
++      TPX_NAKAMA_EXCHANGE_SECRET_VERSION: ${{ vars.TPX_NAKAMA_EXCHANGE_SECRET_VERSION }}
+       TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL: ${{ vars.TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL }}
+       TPX_PLATFORM_USERNAME_VALIDATE_URL: ${{ vars.TPX_PLATFORM_USERNAME_VALIDATE_URL }}
+       TPX_PLATFORM_TELEMETRY_EVENTS_URL: ${{ vars.TPX_PLATFORM_TELEMETRY_EVENTS_URL }}
+@@ -66,12 +69,17 @@ jobs:
+         shell: bash
+         run: |
+           set -euo pipefail
+-          for key in GCP_PROJECT_ID GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT CLOUDRUN_SERVICE CLOUDRUN_RUNTIME_SERVICE_ACCOUNT CLOUDSQL_INSTANCE_CONNECTION_NAME TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL TPX_PLATFORM_USERNAME_VALIDATE_URL TPX_PLATFORM_TELEMETRY_EVENTS_URL; do
++          for key in GCP_PROJECT_ID GCP_WORKLOAD_IDENTITY_PROVIDER GCP_SERVICE_ACCOUNT CLOUDRUN_SERVICE CLOUDRUN_RUNTIME_SERVICE_ACCOUNT CLOUDSQL_INSTANCE_CONNECTION_NAME TPX_NAKAMA_EXCHANGE_SECRET TPX_NAKAMA_EXCHANGE_SECRET_VERSION TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL TPX_PLATFORM_USERNAME_VALIDATE_URL TPX_PLATFORM_TELEMETRY_EVENTS_URL; do
+             if [ -z "${!key:-}" ]; then
+               echo "Missing required variable: ${key}"
+               exit 1
+             fi
+           done
++          # Restrict substitution to a local Secret Manager name and immutable version.
++          if [[ ! "${TPX_NAKAMA_EXCHANGE_SECRET}" =~ ^[A-Za-z0-9_-]+$ ]] || [[ ! "${TPX_NAKAMA_EXCHANGE_SECRET_VERSION}" =~ ^[1-9][0-9]*$ ]]; then
++            echo "Exchange secret name/version metadata is invalid"
++            exit 1
++          fi
+           if [ ! -f "${CLOUDRUN_SERVICE_TEMPLATE}" ]; then
+             echo "Missing Cloud Run service template: ${CLOUDRUN_SERVICE_TEMPLATE}"
+             exit 1
+@@ -130,6 +138,8 @@ jobs:
+             -e "s|__CLOUDSQL_INSTANCES__|${CLOUDSQL_INSTANCE_CONNECTION_NAME}|g" \
+             -e "s|__CLOUDRUN_VPC_CONNECTOR__|${vpc_connector}|g" \
+             -e "s|__CLOUDRUN_VPC_EGRESS__|${vpc_egress}|g" \
++            -e "s|__TPX_NAKAMA_EXCHANGE_SECRET__|${TPX_NAKAMA_EXCHANGE_SECRET}|g" \
++            -e "s|__TPX_NAKAMA_EXCHANGE_SECRET_VERSION__|${TPX_NAKAMA_EXCHANGE_SECRET_VERSION}|g" \
+             -e "s|__TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL__|${TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL}|g" \
+             -e "s|__TPX_PLATFORM_USERNAME_VALIDATE_URL__|${TPX_PLATFORM_USERNAME_VALIDATE_URL}|g" \
+             -e "s|__TPX_PLATFORM_TELEMETRY_EVENTS_URL__|${TPX_PLATFORM_TELEMETRY_EVENTS_URL}|g" \
+diff --git a/backend/nakama/cloudrun/IDENTITY_ROLLOUT_READINESS.md b/backend/nakama/cloudrun/IDENTITY_ROLLOUT_READINESS.md
+new file mode 100644
+index 0000000..3c20d20
+--- /dev/null
++++ b/backend/nakama/cloudrun/IDENTITY_ROLLOUT_READINESS.md
+@@ -0,0 +1,140 @@
++# Identity rollout readiness — 2026-10-20
++
++Status: NOT ready to merge or deploy. Preparation only, no credentials, live settings,
++publication or deployment changed. Verified GitHub connector identity: TeraPixelGames.
++
++## Reviewed revisions and checks
++
++- Platform draft PR7: `7d8e2af8a2ae2d5a38dbe24b16c651b4873ac5bf`, base main
++  `bfa62903fd6044727528038148a2b774ebd2ef55`. Test check success; GitHub mergeable
++  state blocked (cause not established; do not bypass). Local Node20 full suite 94/94.
++- LumaRush draft PR13: `bca6930c5fec5f3edb901ea6d1bfeb49a185de4c`, base main
++  `71bb381dab1fe1fc9b78ce34d65b140d528438ca`. All five reported checks success
++  (unit, UAT, backend-tests, godot-tests, sync). Local backend suite 17/17.
++- This local follow-up is based on PR13, not included in either remote PR. Backend
++  tests including secret-reference/preflight coverage: 19/19. No engine/container
++  startup or live Nakama test was performed. Shell syntax and diff checks pass.
++
++## Remaining security and compatibility gates
++
++Gateway authentication binds a dedicated backend credential to normalized game ID,
++signs game_id, and keeps issuer/audience server-owned. It authenticates a backend
++assertion, not a Nakama player JWT. A credential authorizes assertions for any user
++within its game; never grant one to payload-selected-user RPCs.
++
++Platform save, IAP, flags and telemetry routes do not enforce signed game_id against
++request game_id. A local-only characterization using fixed signed test fixtures and
++mock services confirmed HTTP200 for a lumarush token requesting different-game in
++save sync and IAP verify. No real balances, provider or production was touched.
++Correct downstream checks before claiming game isolation. Preserve intentional
++platform-wide web/magic-link sessions through an explicit policy, rather than
++blindly requiring game_id everywhere. IAP entitlements also returns account-wide
++coins; decide/filter its game view consistently. New scoped tokens must reject
++mismatched games before store/provider work. Add tests for matching/mismatched and
++malformed claims, legacy Nakama claims, web sessions and wrong audience.
++
++Public magic links must remain available: do not make the entire gateway private.
++Existing issued sessions remain valid until expiry; deleting the exchange mapping
++stops new exchanges only. Incident-driven session revocation requires separate
++approval and a defined blast radius. No allow-all or admin-key fallback is acceptable.
++
++Active LumaRush runtime is lumarush.js in local.yml and render/start.sh; index.js is
++an alternative, independently tested, not a replacement for active-path inspection.
++Active config uses TPX_GAME_ID and the full identity exchange URL. Alternative
++index.js uses GAME_ID and PLATFORM_IDENTITY_URL. Container environment alone is
++insufficient for Compose: mounted local.yml needs a private runtime.env override.
++Do not use the traced Compose startup command for secret values.
++
++A fresh default-branch GitHub search still returned 68 route matches with
++incomplete_results=false. The 21 copied game index.js files retain old blob
++4b5209bf5b04e2a25d399fc6ae9f9eba621570d0; racer and GlowPath remain distinct variants.
++ArcadeCore canonical template retains the old blob. Previous local canonical fix
++29d0f7d and platform scaffold c42eee7 remain unpublished. Inventory is source-only,
++not proof that every matching module is deployed. Additional active SnakeGame and
++color_crunch paths need proof headers; GlowPath sends admin-key instead. Do not
++provision keys for those callers until their actual entrypoints are corrected.
++
++## Deployment gates
++
++Platform main pushes can auto-deploy staging when CLOUDRUN_ENABLED is enabled;
++CI and deployment are separate workflows. Platform deployment actions retain
++floating version refs even though CI was pinned; the previously observed full-SHA
++organization policy can reject deploy workflow startup. Live policy/gates unverified.
++The platform workflow deploys all manifest services, not identity only, and applies
++public/private flags. Do not dispatch it as an identity-only operation without
++separately authorizing that scope or first preparing a narrow release mechanism.
++
++LumaRush main pushes target staging and can publish Pages. Version tags/manual
++paths can target production. Neither repository proves main ancestry for manual/tag
++releases. LumaRush defaults both environments' service name to lumarush-nakama;
++explicit project/service/runtime-account/DB/URL isolation must be confirmed before
++merge. External Render dashboard hooks and live GitHub environment gates were not
++inspected. A successful CI check does not certify deployment readiness.
++
++## Proposed credential destinations (names require approval/inventory)
++
++For EACH environment independently:
++
++1. LumaRush project Secret Manager resource `lumarush-nakama-exchange-staging` or
++   `lumarush-nakama-exchange-prod`, immutable numeric version. Runtime env destination
++   TPX_NAKAMA_EXCHANGE_KEY via secretKeyRef; startup forwards into Nakama runtime.env.
++   GitHub staging/production variables TPX_NAKAMA_EXCHANGE_SECRET and
++   TPX_NAKAMA_EXCHANGE_SECRET_VERSION contain metadata only.
++2. Platform project aggregate resource `terapixel-nakama-exchange-keys-staging` or
++   `terapixel-nakama-exchange-keys-prod`, immutable version. Runtime env destination
++   NAKAMA_EXCHANGE_KEYS_JSON, with the matching lumarush entry. Use only the
++   identity-gateway entry in environment CLOUDRUN_SECRET_REFS_BY_SERVICE, never
++   common configuration that exposes the aggregate to unrelated services.
++3. Existing gateway runtime account: secretAccessor only on its aggregate resource.
++   Existing LumaRush runtime account: secretAccessor only on its game's resource.
++   No game runtime should read the aggregate or other games/environments' secrets.
++4. A separately approved provisioning principal needs secret create if absent,
++   versions.add on named resources, and getIamPolicy/setIamPolicy only where access
++   bindings must change. Runtime readers do not need secret administration.
++5. Existing deploy principal needs target Cloud Run update and iam.serviceAccounts.actAs
++   on the selected runtime account, plus existing build/artifact permissions for a
++   release. Do not create service-account keys or grant project-wide secret access.
++   Actual resource IDs, project IDs and account emails remain unverified: do not
++   substitute guessed targets into commands. GitHub TeraPixel identity does not
++   establish GCP authority.
++
++Cloud Run/Secret Manager references:
++https://docs.cloud.google.com/run/docs/configuring/services/secrets
++https://docs.cloud.google.com/secret-manager/docs/access-control
++
++## Staged release and rollback plan — requires later approvals
++
++1. Finish downstream game binding and caller/runtime inventory; review local wiring,
++   canonical/scaffold corrections, release action pins and main-ancestry gates.
++2. Inspect target metadata/IAM and environment approvals read-only, recording exact
++   project, region, service, runtime account, secret metadata, previous image/revision
++   and pinned secret version. Do not read/print existing secret payloads in reports.
++3. Obtain bounded staging-only approval for named secret provisioning/bindings and
++   exact revision deployment. Confirm main merges cannot unintentionally deploy
++   production/shared targets. Merge reviewed code to each main before staging.
++4. There is no safe compatibility bypass: schedule the availability transition.
++   Deploy the hardened gateway then trusted caller with matching staging secret;
++   old callers receive 401. If caller is released first, its protected credential
++   may be sent to an old gateway that ignores it, so it does not close the hole.
++   Admit only audited games; leave others unconfigured/fail-closed until ready.
++5. Validate a real controlled staging Nakama login/exchange end-to-end; use the two
++   authenticated test accounts to verify caller identity cannot be overridden.
++   Missing/wrong/game-mismatched proof must fail; verify audience and downstream
++   cross-game denial, public magic-link success, secret-free logs and restart
++   configuration. Record exact main SHAs/images and metrics without token values.
++6. After staging acceptance, request separate production credential/binding and
++   release approval, using reviewed main ancestry and tested artifacts. Never tag,
++   merge, dispatch or change live IAM as part of this preparation.
++7. Rollback must retain the authenticated gateway. Revert a faulty caller to a
++   previously hardened compatible revision, or disable the affected game's mapping
++   and accept exchange unavailability. Do not route traffic to the old vulnerable
++   gateway or reinstate proof-free/admin-key fallback. Retain previous hardened
++   images and pinned secret versions; coordinate both ends for rotation/rollback.
++   Revocation requires a new loaded mapping/revision; existing issued sessions need
++   separate expiry/revocation handling. Capture health/401/error rates before/after.
++
++Next approval should first identify/inspect exact staging cloud and GitHub
++configuration metadata under an authorized TeraPixel account; it is not yet safe to
++request a broad production rollout. Publication, main merges, credentials/IAM and
++staging deployment remain separate action-time approvals. PostgreSQL startup stays
++pending and wallet/billing/saves/saga/loading work remains paused.
+diff --git a/backend/nakama/cloudrun/README.md b/backend/nakama/cloudrun/README.md
+index bcc2676..013754d 100644
+--- a/backend/nakama/cloudrun/README.md
++++ b/backend/nakama/cloudrun/README.md
+@@ -61,3 +61,30 @@ gcloud run services replace /tmp/lumarush-nakama-service.yaml \
+ ```
+ 
+ `backend/nakama/render/start.sh` is reused for Cloud Run. It accepts DB config via `DB_ADDRESS` (preferred), `DATABASE_URL`, or `DB_*` parts.
++
++
++## Identity exchange rollout gate (local preparation only)
++
++The service template now injects server-only `TPX_NAKAMA_EXCHANGE_KEY` via Secret
++Manager. Environment-scoped GitHub **variables** `TPX_NAKAMA_EXCHANGE_SECRET` and
++`TPX_NAKAMA_EXCHANGE_SECRET_VERSION` hold only a secret resource name and a positive
++numeric version. No credential value belongs in Actions variables, logs, rendered
++YAML `value` fields or client builds. Manual template rendering must substitute
++both new placeholders as well. The workflow rejects missing/malformed metadata
++before cloud authentication; it does not create secrets or grant access.
++
++Proposed resource names, subject to inventory and separate approval:
++`lumarush-nakama-exchange-staging` and `lumarush-nakama-exchange-prod`, each in the
++actual target project and distinct from every other game/environment. Bind the
++runtime service account to secret accessor on its single environment's resource;
++use an approved immutable version. Gateway runtime receives the matching lumarush
++mapping through its own aggregate secret. Do not reuse the platform admin key.
++Render fallback needs a protected, separately approved `TPX_NAKAMA_EXCHANGE_KEY`
++setting; the blueprint declares it `sync: false` and supplies no value.
++
++The workflow defaults `CLOUDRUN_SERVICE` to `lumarush-nakama` for both targets.
++Before any release, verify explicit staging/production project/service/runtime
++account/DB/URL isolation: the default is not evidence of separate environments.
++Merging main triggers staging and Pages workflows; tags/manual targets can deploy
++production without proving main ancestry. Do not merge/tag/dispatch merely to
++validate this wiring. Current remote PR13 is unchanged by this local follow-up.
+diff --git a/backend/nakama/cloudrun/service.template.yaml b/backend/nakama/cloudrun/service.template.yaml
+index 55c9c16..98fcd47 100644
+--- a/backend/nakama/cloudrun/service.template.yaml
++++ b/backend/nakama/cloudrun/service.template.yaml
+@@ -65,6 +65,11 @@ spec:
+                 secretKeyRef:
+                   name: tpx-magic-link-notify-secret
+                   key: latest
++            - name: TPX_NAKAMA_EXCHANGE_KEY
++              valueFrom:
++                secretKeyRef:
++                  name: "__TPX_NAKAMA_EXCHANGE_SECRET__"
++                  key: "__TPX_NAKAMA_EXCHANGE_SECRET_VERSION__"
+             - name: TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL
+               value: "__TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL__"
+             - name: TPX_PLATFORM_USERNAME_VALIDATE_URL
+diff --git a/backend/nakama/tests/rollout_configuration.test.js b/backend/nakama/tests/rollout_configuration.test.js
+new file mode 100644
+index 0000000..d813626
+--- /dev/null
++++ b/backend/nakama/tests/rollout_configuration.test.js
+@@ -0,0 +1,35 @@
++const test = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const path = require('node:path');
++const { spawnSync } = require('node:child_process');
++const root = path.resolve(__dirname, '../../..');
++const workflow = fs.readFileSync(path.join(root, '.github/workflows/cloudrun-nakama-deploy.yml'), 'utf8');
++const template = fs.readFileSync(path.join(root, 'backend/nakama/cloudrun/service.template.yaml'), 'utf8');
++const start = workflow.indexOf('      - name: Validate required configuration');
++const finish = workflow.indexOf('      - name:', start + 10);
++const section = workflow.slice(start, finish);
++const script = section.slice(section.indexOf('        run: |\n') + '        run: |\n'.length).split('\n').map(line => line.replace(/^          /, '')).join('\n');
++function validate(name, version) {
++  const env = { PATH: process.env.PATH };
++  for (const key of ['GCP_PROJECT_ID','GCP_WORKLOAD_IDENTITY_PROVIDER','GCP_SERVICE_ACCOUNT','CLOUDRUN_SERVICE','CLOUDRUN_RUNTIME_SERVICE_ACCOUNT','CLOUDSQL_INSTANCE_CONNECTION_NAME','TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL','TPX_PLATFORM_USERNAME_VALIDATE_URL','TPX_PLATFORM_TELEMETRY_EVENTS_URL']) env[key] = 'local-metadata-fixture';
++  env.CLOUDRUN_SERVICE_TEMPLATE = 'backend/nakama/cloudrun/service.template.yaml';
++  env.TPX_NAKAMA_EXCHANGE_SECRET = name;
++  env.TPX_NAKAMA_EXCHANGE_SECRET_VERSION = version;
++  return spawnSync('bash', ['-c', script], { cwd: root, env, encoding: 'utf8' });
++}
++test('deployment preflight requires safe secret resource metadata and an immutable version', () => {
++  assert.equal(validate('lumarush-nakama-exchange-staging', '3').status, 0);
++  for (const [name,version] of [['','3'],['secret',''],['secret','latest'],['secret','0'],['secret','1.5'],['secret','1&bad'],['secret|sed','3'],['secret\nname','3'],['other/project','3']]) {
++    assert.notEqual(validate(name,version).status, 0, `${JSON.stringify([name,version])} must fail before cloud auth`);
++  }
++});
++test('rendered exchange credential uses secret reference, never a plaintext value', () => {
++  const rendered = template.replaceAll('__TPX_NAKAMA_EXCHANGE_SECRET__','lumarush-nakama-exchange-staging').replaceAll('__TPX_NAKAMA_EXCHANGE_SECRET_VERSION__','3');
++  const block = rendered.split('- name: TPX_NAKAMA_EXCHANGE_KEY')[1].split('- name:')[0];
++  assert.match(block, /valueFrom:\s+secretKeyRef:\s+name: "lumarush-nakama-exchange-staging"\s+key: "3"/);
++  assert.doesNotMatch(block, /\bvalue:/);
++  assert.match(workflow, /s\|__TPX_NAKAMA_EXCHANGE_SECRET__\|\$\{TPX_NAKAMA_EXCHANGE_SECRET\}\|g/);
++  assert.match(workflow, /s\|__TPX_NAKAMA_EXCHANGE_SECRET_VERSION__\|\$\{TPX_NAKAMA_EXCHANGE_SECRET_VERSION\}\|g/);
++  assert.match(fs.readFileSync(path.join(root,'render.yaml'),'utf8'), /- key: TPX_NAKAMA_EXCHANGE_KEY\s+sync: false/);
++});
+diff --git a/render.yaml b/render.yaml
+index f743534..056235a 100644
+--- a/render.yaml
++++ b/render.yaml
+@@ -67,6 +67,8 @@ services:
+         sync: false
+       - key: TPX_PLATFORM_IAP_ADMIN_KEY
+         sync: false
++      - key: TPX_NAKAMA_EXCHANGE_KEY
++        sync: false
+       - key: TPX_GAME_ID
+         value: "lumarush"
+       - key: TPX_HTTP_TIMEOUT_MS
+-- 
+2.39.3 (Apple Git-145)
+

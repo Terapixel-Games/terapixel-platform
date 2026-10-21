@@ -1,0 +1,881 @@
+From 84ebd2ba081082ab15d530889c966c00750ca552 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:12:27 -0500
+Subject: [PATCH] Pin PostgreSQL merge transactions and consume identity tokens
+ once
+
+---
+ packages/shared-utils/index.js                |   1 +
+ .../shared-utils/src/postgresTransaction.js   |  27 +++
+ services/iap-service/README.md                |  36 +++
+ .../iap-service/src/store/postgresIapStore.js |  47 ++--
+ services/identity-gateway/README.md           |  57 +++++
+ .../identity-gateway/src/identityStore.js     |  78 +++---
+ test/identity-single-use-http.test.js         |  20 ++
+ test/postgres-consumption-integration.test.js | 118 ++++++++++
+ test/postgres-consumption.test.js             | 222 ++++++++++++++++++
+ 9 files changed, 552 insertions(+), 54 deletions(-)
+ create mode 100644 packages/shared-utils/src/postgresTransaction.js
+ create mode 100644 test/identity-single-use-http.test.js
+ create mode 100644 test/postgres-consumption-integration.test.js
+ create mode 100644 test/postgres-consumption.test.js
+
+diff --git a/packages/shared-utils/index.js b/packages/shared-utils/index.js
+index 93e07f6..cdc8006 100644
+--- a/packages/shared-utils/index.js
++++ b/packages/shared-utils/index.js
+@@ -13,3 +13,4 @@ export {
+   createRuntimeConfigProvider,
+   createNoopRuntimeConfigProvider
+ } from "./src/platformRuntimeConfigProvider.js";
++export { withPostgresTransaction } from "./src/postgresTransaction.js";
+diff --git a/packages/shared-utils/src/postgresTransaction.js b/packages/shared-utils/src/postgresTransaction.js
+new file mode 100644
+index 0000000..023184d
+--- /dev/null
++++ b/packages/shared-utils/src/postgresTransaction.js
+@@ -0,0 +1,27 @@
++// A transaction owns one checked-out client, including any helper queries.
++export async function withPostgresTransaction(pool, operation) {
++  const client = await pool.connect();
++  let began = false;
++  let releaseError;
++  try {
++    await client.query("BEGIN");
++    began = true;
++    const result = await operation(client);
++    await client.query("COMMIT");
++    return result;
++  } catch (error) {
++    if (began) {
++      try {
++        await client.query("ROLLBACK");
++      } catch (rollbackError) {
++        releaseError = rollbackError;
++      }
++    } else {
++      releaseError = error;
++    }
++    throw error;
++  } finally {
++    // A failed rollback leaves connection state uncertain; discard that client.
++    client.release(releaseError);
++  }
++}
+diff --git a/services/iap-service/README.md b/services/iap-service/README.md
+index fe7b006..5337e6c 100644
+--- a/services/iap-service/README.md
++++ b/services/iap-service/README.md
+@@ -55,3 +55,39 @@ Purpose: purchase verification and entitlement source of truth.
+ - `poki` -> `paypal_web`
+ - `crazygames` -> `paypal_web`
+ - `web` -> `paypal_web`
++
++## PostgreSQL profile-merge transaction ownership
++
++The PostgreSQL store now pins profile merging to one checked-out client, including
++subscription reads/writes. A SHARE ROW EXCLUSIVE lock on `iap_coin_balances` and
++`iap_subscriptions` serializes merge writers and ordinary INSERT/UPDATE/DELETE
++operations during the local transfer, including legacy writers without advisory
++lock cooperation. This prevents two overlapping merges from copying the same
++secondary balance or a wallet writer changing rows between copying and zeroing.
++Subscription choice and `{ merged: true|false }` response semantics are unchanged.
++Errors roll back the complete transfer and release the client; rollback failure
++discards the connection without replacing the original error.
++
++The table-wide locks are deliberately conservative and can delay grants/debits
++for other profiles while a merge runs. There are no remote calls inside the
++transaction. Validate this latency/locking tradeoff and the runtime DB role's
++ability to take these locks before release; no permissions/configuration are
++changed here. No schema migration is required.
++
++This patch uses original main baseline `bfa6290`, without a wallet or billing
++branch dependency. Its subscription-write helper extraction mirrors the wallet
++atomicity patch, so integration should retain both the atomic wallet operation
++and pinned merge helpers. This branch alone does not contain the earlier wallet
++atomicity fix. All approved fixes still require review/integration into main
++before staging and production.
++
++A grant made to the secondary profile after merge commit stays on that profile;
++this patch does not redirect late writes or implement durable merge jobs. The
++cross-service coordinator, idempotent saga/reconciliation, memory-store merge
++concurrency and JSON file-store follow-up are separate changes. Existing
++subscription/provider/webhook behavior is unchanged.
++
++`test/postgres-consumption.test.js` checks pinned SQL and injected failures using
++scripted clients. Optional real local DB tests and installed-tool availability
++are documented in the identity-gateway README. Real PostgreSQL concurrency,
++rollback and lock behavior have not been executed here and remain a release gate.
+diff --git a/services/iap-service/src/store/postgresIapStore.js b/services/iap-service/src/store/postgresIapStore.js
+index 248c42b..65e5b58 100644
+--- a/services/iap-service/src/store/postgresIapStore.js
++++ b/services/iap-service/src/store/postgresIapStore.js
+@@ -1,8 +1,10 @@
++import { withPostgresTransaction } from "../../../../packages/shared-utils/index.js";
++
+ export class PostgresIapStore {
+   constructor(options = {}) {
+     this._pool = options.pool;
+-    if (!this._pool || typeof this._pool.query !== "function") {
+-      throw new Error("PostgresIapStore requires pool.query");
++    if (!this._pool || typeof this._pool.query !== "function" || typeof this._pool.connect !== "function") {
++      throw new Error("PostgresIapStore requires pool.query and pool.connect");
+     }
+   }
+ 
+@@ -99,7 +101,11 @@ export class PostgresIapStore {
+   }
+ 
+   async getSubscription(profileId) {
+-    const result = await this._pool.query(
++    return this._getSubscription(this._pool, profileId);
++  }
++
++  async _getSubscription(executor, profileId) {
++    const result = await executor.query(
+       `SELECT provider, external_subscription_id, status, active, expires_at
+        FROM iap_subscriptions WHERE profile_id = $1 LIMIT 1`,
+       [normalize(profileId)]
+@@ -121,8 +127,13 @@ export class PostgresIapStore {
+   }
+ 
+   async upsertSubscription(profileId, subscription) {
++    await this._writeSubscription(this._pool, profileId, subscription);
++    return this.getSubscription(profileId);
++  }
++
++  async _writeSubscription(executor, profileId, subscription) {
+     const expiresAt = Number(subscription?.expiresAt);
+-    await this._pool.query(
++    await executor.query(
+       `
+       INSERT INTO iap_subscriptions (profile_id, provider, external_subscription_id, status, active, expires_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+@@ -145,7 +156,6 @@ export class PostgresIapStore {
+           : null
+       ]
+     );
+-    return this.getSubscription(profileId);
+   }
+ 
+   async mergeProfiles(primaryProfileId, secondaryProfileId) {
+@@ -155,9 +165,12 @@ export class PostgresIapStore {
+       return { merged: false };
+     }
+ 
+-    await this._pool.query("BEGIN");
+-    try {
+-      const secondaryCoins = await this._pool.query(
++    return withPostgresTransaction(this._pool, async (client) => {
++      // Rare account merges serialize writers on these tables, including legacy
++      // callers that do not participate in application-specific advisory locks.
++      // Reads remain available. Keep the whole transfer on this client.
++      await client.query("LOCK TABLE iap_coin_balances, iap_subscriptions IN SHARE ROW EXCLUSIVE MODE");
++      const secondaryCoins = await client.query(
+         `SELECT game_id, balance FROM iap_coin_balances WHERE profile_id = $1`,
+         [secondary]
+       );
+@@ -166,7 +179,7 @@ export class PostgresIapStore {
+         if (delta <= 0) {
+           continue;
+         }
+-        await this._pool.query(
++        await client.query(
+           `
+           INSERT INTO iap_coin_balances (profile_id, game_id, balance, updated_at)
+           VALUES ($1, $2, $3, NOW())
+@@ -176,26 +189,22 @@ export class PostgresIapStore {
+           [primary, row.game_id, delta]
+         );
+       }
+-      await this._pool.query(
++      await client.query(
+         `UPDATE iap_coin_balances SET balance = 0, updated_at = NOW() WHERE profile_id = $1`,
+         [secondary]
+       );
+ 
+-      const primarySub = await this.getSubscription(primary);
+-      const secondarySub = await this.getSubscription(secondary);
++      const primarySub = await this._getSubscription(client, primary);
++      const secondarySub = await this._getSubscription(client, secondary);
+       const chosen = chooseSubscription(primarySub, secondarySub);
+-      await this.upsertSubscription(primary, chosen);
+-      await this.upsertSubscription(secondary, {
++      await this._writeSubscription(client, primary, chosen);
++      await this._writeSubscription(client, secondary, {
+         active: false,
+         status: "merged",
+         provider: chosen.provider || ""
+       });
+-      await this._pool.query("COMMIT");
+       return { merged: true };
+-    } catch (error) {
+-      await this._pool.query("ROLLBACK");
+-      throw error;
+-    }
++    });
+   }
+ 
+   async close() {
+diff --git a/services/identity-gateway/README.md b/services/identity-gateway/README.md
+index e8c7349..19e8d12 100644
+--- a/services/identity-gateway/README.md
++++ b/services/identity-gateway/README.md
+@@ -110,3 +110,60 @@ Optional env:
+ Notes:
+ - Magic-link web completion redirect now returns only `tpx_auth=1` (no identity PII query params).
+ - Browser identity should hydrate via `GET /v1/web/session` cookie check.
++
++## PostgreSQL transaction ownership and single-use consumption
++
++Merge-code redemption and magic-link consumption use a checked-out PostgreSQL
++client for BEGIN, row locking, validation, conditional consumption, helper calls
++and COMMIT. The shared `withPostgresTransaction` helper rolls back errors and
++releases in `finally`; a failed rollback discards the client while preserving the
++original error. Both token SELECTs use `FOR UPDATE`, followed by a conditional
++`used_at IS NULL` update with `RETURNING`. Reuse is rejected even if a stored
++used timestamp is zero. Validation/write failure rolls back consumption, so the
++same token/code remains usable if the failure occurred before commit.
++
++Merge-code redemption also locks `identity_merges` in SHARE ROW EXCLUSIVE mode
++while resolving both canonical profile IDs and writing the merge edge. This is
++a table-wide writer lock, held only for the local database transaction; ordinary
++reads continue. It intentionally trades brief merge-writer serialization for a
++stable canonical lookup. Existing direct markMerged/service merge flows are not
++converted into a cross-service saga by this patch.
++
++Memory parity fixes recheck merge-code usage after asynchronous profile lookup
++and validate missing magic-link profiles before marking the token used. Existing
++return fields, public completion HTML/cookie behavior and expiry comparison are
++preserved. No HTTP routes or session/provider authentication are changed here.
++
++Scope ends at the local-store commit. A downstream migration, notification,
++session-cookie or network failure after commit does not unconsume a token/code.
++Reliable cross-service merges and retry/reconciliation jobs remain separate work.
++A connection error around COMMIT can leave its outcome uncertain; do not assume
++an error proves rollback. Request a fresh magic link if completion cannot be
++recovered. No schema migration or live configuration changes are included.
++
++Validation: `test/postgres-consumption.test.js` uses scripted clients to verify
++same-client SQL, locks, conditional updates and rollback/release paths, plus real
++in-memory concurrent-use tests. `test/identity-single-use-http.test.js` checks
++unauthenticated public completion/cookie behavior and concurrent reuse rejection.
++These mocks do not demonstrate PostgreSQL lock behavior.
++
++`test/postgres-consumption-integration.test.js` provides two opt-in real database
++tests for concurrent code/token use, transactional fault/retry, repeated wallet
++merges and writer exclusion. They are skipped unless
++`CONSUMPTION_TEST_LOCAL_DATABASE_URL` explicitly names an existing loopback DB
++(no query-string overrides). Tests require the existing `pg` dependency and
++permission to create/drop their own isolated schema. They never read DATABASE_URL
++and never start a service. Run with Node 20:
++`node --test test/postgres-consumption-integration.test.js`.
++Real PostgreSQL execution remains unperformed and is a release gate.
++
++Local tools inspected: PostgreSQL 14.8 (`postgres`, `initdb`, `pg_ctl`, `psql`)
++and Docker 28.5.1 are installed. PostgreSQL did not respond on 127.0.0.1:5432 or
++the default /tmp socket; the configured Docker daemon at localhost:4243 was also
++unavailable. Options, requiring separate approval: create a disposable native
++cluster in a task/tmp directory with a private socket, or start an isolated
++PostgreSQL container once Docker is available. No service was started/installed,
++no existing database cluster was modified and no credentials were generated.
++
++References: https://node-postgres.com/features/transactions and
++https://www.postgresql.org/docs/14/explicit-locking.html.
+diff --git a/services/identity-gateway/src/identityStore.js b/services/identity-gateway/src/identityStore.js
+index 51f4f99..f1637e4 100644
+--- a/services/identity-gateway/src/identityStore.js
++++ b/services/identity-gateway/src/identityStore.js
+@@ -1,4 +1,5 @@
+ import crypto from "node:crypto";
++import { withPostgresTransaction } from "../../../packages/shared-utils/index.js";
+ 
+ export class InMemoryIdentityStore {
+   constructor() {
+@@ -86,7 +87,7 @@ export class InMemoryIdentityStore {
+     if (!record) {
+       throw new Error("merge code not found");
+     }
+-    if (record.usedAt) {
++    if (record.usedAt || record.usedBySecondaryProfileId) {
+       throw new Error("merge code already used");
+     }
+     if (record.expiresAt < now) {
+@@ -96,6 +97,11 @@ export class InMemoryIdentityStore {
+     if (primary === secondary) {
+       throw new Error("cannot merge an account into itself");
+     }
++    if (!primary || !secondary) throw new Error("invalid merge pair");
++    // Resolving canonical profiles above yields; recheck immediately before use.
++    if (record.usedAt || record.usedBySecondaryProfileId) {
++      throw new Error("merge code already used");
++    }
+     record.usedAt = now;
+     record.usedBySecondaryProfileId = secondary;
+     this._mergeCodes.set(codeHash, record);
+@@ -175,17 +181,18 @@ export class InMemoryIdentityStore {
+     if (!entry) {
+       throw new Error("magic link token not found");
+     }
+-    if (entry.usedAt) {
++    if (entry.usedAt || entry.usedByProfileId) {
+       throw new Error("magic link token already used");
+     }
+     if (entry.expiresAt < now) {
+       throw new Error("magic link token expired");
+     }
+-    entry.usedAt = now;
+-    entry.usedByProfileId = requestedProfileId || normalize(entry.profileId);
+-    if (!entry.usedByProfileId) {
++    const usedByProfileId = requestedProfileId || normalize(entry.profileId);
++    if (!usedByProfileId) {
+       throw new Error("magic link token missing profile");
+     }
++    entry.usedAt = now;
++    entry.usedByProfileId = usedByProfileId;
+     this._magicLinks.set(tokenHash, entry);
+     return {
+       email: entry.email,
+@@ -200,8 +207,8 @@ export class InMemoryIdentityStore {
+ export class PostgresIdentityStore {
+   constructor(options = {}) {
+     this._pool = options.pool;
+-    if (!this._pool || typeof this._pool.query !== "function") {
+-      throw new Error("PostgresIdentityStore requires pool.query");
++    if (!this._pool || typeof this._pool.query !== "function" || typeof this._pool.connect !== "function") {
++      throw new Error("PostgresIdentityStore requires pool.query and pool.connect");
+     }
+   }
+ 
+@@ -391,11 +398,15 @@ export class PostgresIdentityStore {
+   }
+ 
+   async resolvePrimaryProfileId(profileId) {
++    return this._resolvePrimaryProfileId(this._pool, profileId);
++  }
++
++  async _resolvePrimaryProfileId(executor, profileId) {
+     let current = normalize(profileId);
+     const visited = new Set();
+     while (current && !visited.has(current)) {
+       visited.add(current);
+-      const result = await this._pool.query(
++      const result = await executor.query(
+         `SELECT primary_profile_id FROM identity_merges WHERE secondary_profile_id = $1 LIMIT 1`,
+         [current]
+       );
+@@ -434,18 +445,16 @@ export class PostgresIdentityStore {
+   }
+ 
+   async redeemMergeCode(secondaryProfileId, code, options = {}) {
+-    const secondary = await this.resolvePrimaryProfileId(secondaryProfileId);
+     const now = toInt(options.nowSeconds, Math.floor(Date.now() / 1000));
+     const codeHash = hashCode(code);
+ 
+-    await this._pool.query("BEGIN");
+-    try {
+-      const codeRow = await this._pool.query(
++    return withPostgresTransaction(this._pool, async (client) => {
++      const codeRow = await client.query(
+         `
+         SELECT primary_profile_id, created_at, expires_at, used_at
+         FROM identity_merge_codes
+         WHERE code_hash = $1
+-        LIMIT 1
++        LIMIT 1 FOR UPDATE
+       `,
+         [codeHash]
+       );
+@@ -453,23 +462,29 @@ export class PostgresIdentityStore {
+       if (!row) {
+         throw new Error("merge code not found");
+       }
+-      if (toInt(row.used_at, 0) > 0) {
++      if (row.used_at !== null && row.used_at !== undefined) {
+         throw new Error("merge code already used");
+       }
+       if (toInt(row.expires_at, 0) < now) {
+         throw new Error("merge code expired");
+       }
+-      const primary = await this.resolvePrimaryProfileId(row.primary_profile_id);
++      // Keep canonical resolution stable against concurrent merge-edge writes.
++      await client.query("LOCK TABLE identity_merges IN SHARE ROW EXCLUSIVE MODE");
++      const secondary = await this._resolvePrimaryProfileId(client, secondaryProfileId);
++      const primary = await this._resolvePrimaryProfileId(client, row.primary_profile_id);
++      if (!primary || !secondary) throw new Error("invalid merge pair");
+       if (primary === secondary) {
+         throw new Error("cannot merge an account into itself");
+       }
+-      await this._pool.query(
++      const consumed = await client.query(
+         `UPDATE identity_merge_codes
+          SET used_at = $2, used_by_secondary_profile_id = $3
+-         WHERE code_hash = $1`,
++         WHERE code_hash = $1 AND used_at IS NULL
++         RETURNING code_hash`,
+         [codeHash, now, secondary]
+       );
+-      await this._pool.query(
++      if (consumed.rows.length !== 1) throw new Error("merge code already used");
++      await client.query(
+         `
+         INSERT INTO identity_merges (secondary_profile_id, primary_profile_id, merged_at)
+         VALUES ($1, $2, $3)
+@@ -479,16 +494,12 @@ export class PostgresIdentityStore {
+       `,
+         [secondary, primary, now]
+       );
+-      await this._pool.query("COMMIT");
+       return {
+         primaryProfileId: primary,
+         secondaryProfileId: secondary,
+         mergedAt: now
+       };
+-    } catch (error) {
+-      await this._pool.query("ROLLBACK");
+-      throw error;
+-    }
++    });
+   }
+ 
+   async markMerged(primaryProfileId, secondaryProfileId, mergedAt) {
+@@ -572,14 +583,13 @@ export class PostgresIdentityStore {
+     const requestedProfileId = normalize(profileId);
+     const now = toInt(options.nowSeconds, Math.floor(Date.now() / 1000));
+     const tokenHash = hashCode(token);
+-    await this._pool.query("BEGIN");
+-    try {
+-      const result = await this._pool.query(
++    return withPostgresTransaction(this._pool, async (client) => {
++      const result = await client.query(
+         `
+         SELECT email, profile_id, game_id, expires_at, used_at
+         FROM identity_magic_links
+         WHERE token_hash = $1
+-        LIMIT 1
++        LIMIT 1 FOR UPDATE
+       `,
+         [tokenHash]
+       );
+@@ -587,7 +597,7 @@ export class PostgresIdentityStore {
+       if (!row) {
+         throw new Error("magic link token not found");
+       }
+-      if (toInt(row.used_at, 0) > 0) {
++      if (row.used_at !== null && row.used_at !== undefined) {
+         throw new Error("magic link token already used");
+       }
+       if (toInt(row.expires_at, 0) < now) {
+@@ -598,15 +608,16 @@ export class PostgresIdentityStore {
+       if (!usedByProfileId) {
+         throw new Error("magic link token missing profile");
+       }
+-      await this._pool.query(
++      const consumed = await client.query(
+         `
+         UPDATE identity_magic_links
+         SET used_at = $2, used_by_profile_id = $3
+-        WHERE token_hash = $1
++        WHERE token_hash = $1 AND used_at IS NULL
++        RETURNING token_hash
+       `,
+         [tokenHash, now, usedByProfileId]
+       );
+-      await this._pool.query("COMMIT");
++      if (consumed.rows.length !== 1) throw new Error("magic link token already used");
+       return {
+         email: normalize(row.email),
+         profileId: tokenProfileId,
+@@ -614,10 +625,7 @@ export class PostgresIdentityStore {
+         usedByProfileId,
+         usedAt: now
+       };
+-    } catch (error) {
+-      await this._pool.query("ROLLBACK");
+-      throw error;
+-    }
++    });
+   }
+ 
+   async close() {
+diff --git a/test/identity-single-use-http.test.js b/test/identity-single-use-http.test.js
+new file mode 100644
+index 0000000..64dbac1
+--- /dev/null
++++ b/test/identity-single-use-http.test.js
+@@ -0,0 +1,20 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { createIdentityGatewayService, createIdentityGatewayHttpServer } from "../services/identity-gateway/index.js";
++
++it("public magic-link consumption preserves success HTML/cookie and rejects concurrent reuse", async () => {
++  const secret = "test-public-magic-link-session-secret";
++  const service = createIdentityGatewayService({ sessionSecret: secret });
++  const { token } = await service.identityStore.createMagicLinkToken("player@example.test", "profile", { gameId: "game" });
++  const server = createIdentityGatewayHttpServer({ service, sessionSecret: secret, webSessionCookieSecure: false });
++  const { baseUrl } = await server.listen();
++  try {
++    const responses = await Promise.all(Array.from({ length: 12 }, () => fetch(`${baseUrl}/v1/account/magic-link/consume?ml_token=${encodeURIComponent(token)}`)));
++    assert.equal(responses.filter((response) => response.status === 200).length, 1);
++    assert.equal(responses.filter((response) => response.status === 400).length, 11);
++    const success = responses.find((response) => response.status === 200);
++    assert.match(await success.text(), /Account Linked/i);
++    assert.match(success.headers.get("set-cookie"), /tpx_session=/);
++    assert.equal((await fetch(`${baseUrl}/v1/account/magic-link/consume?ml_token=${encodeURIComponent(token)}`)).status, 400);
++  } finally { await server.close(); }
++});
+diff --git a/test/postgres-consumption-integration.test.js b/test/postgres-consumption-integration.test.js
+new file mode 100644
+index 0000000..e3d12e7
+--- /dev/null
++++ b/test/postgres-consumption-integration.test.js
+@@ -0,0 +1,118 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { PostgresIdentityStore } from "../services/identity-gateway/index.js";
++import { PostgresIapStore } from "../services/iap-service/index.js";
++
++// Requires an explicitly supplied already-running local DB. Never DATABASE_URL.
++const testOptions = { skip: !process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL, timeout: 30_000 };
++let schemaSequence = 0;
++async function withDatabase(run) {
++  const url = new URL(process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL);
++  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
++  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "database must be loopback");
++  assert.equal(url.search, "", "connection-string overrides are forbidden");
++  const { default: pg } = await import("pg");
++  const schema = `consumption_test_${process.pid}_${Date.now()}_${schemaSequence++}`;
++  const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
++  let pool, created = false;
++  try {
++    await admin.query(`CREATE SCHEMA ${schema}`); created = true;
++    pool = new pg.Pool({ connectionString: url.toString(), options: `-c search_path=${schema}`, max: 8, connectionTimeoutMillis: 3000 });
++    await run(pool);
++  } finally {
++    if (pool) await pool.end();
++    try { if (created) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
++    finally { await admin.end(); }
++  }
++}
++
++it("real local PostgreSQL: one-time identity consumption, rollback/retry and concurrency", testOptions, () => withDatabase(async (pool) => {
++  const store = new PostgresIdentityStore({ pool });
++  await store.init();
++  const now = Math.floor(Date.now() / 1000);
++  const code = await store.createMergeCode("primary", { nowSeconds: now });
++  await pool.query(`CREATE FUNCTION reject_edge() RETURNS trigger LANGUAGE plpgsql AS $$
++    BEGIN RAISE EXCEPTION 'injected edge failure'; END $$`);
++  await pool.query("CREATE TRIGGER reject_edge BEFORE INSERT ON identity_merges FOR EACH ROW EXECUTE FUNCTION reject_edge()");
++  await assert.rejects(store.redeemMergeCode("secondary", code.code, { nowSeconds: now }), /injected edge failure/);
++  assert.equal((await pool.query("SELECT used_at FROM identity_merge_codes")).rows[0].used_at, null);
++  assert.equal((await pool.query("SELECT COUNT(*)::int AS n FROM identity_merges")).rows[0].n, 0);
++  await pool.query("DROP TRIGGER reject_edge ON identity_merges");
++  assert.equal((await store.redeemMergeCode("secondary", code.code, { nowSeconds: now })).primaryProfileId, "primary");
++  await assert.rejects(store.redeemMergeCode("other", code.code, { nowSeconds: now }), /already used/);
++
++  const concurrentCode = await store.createMergeCode("other-primary", { nowSeconds: now });
++  const codes = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => store.redeemMergeCode(`other-secondary-${i}`, concurrentCode.code, { nowSeconds: now })));
++  assert.equal(codes.filter((result) => result.status === "fulfilled").length, 1);
++  assert.equal(codes.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++
++  const magic = await store.createMagicLinkToken("player@example.test", "profile", { nowSeconds: now, gameId: "game" });
++  await pool.query(`CREATE FUNCTION reject_magic() RETURNS trigger LANGUAGE plpgsql AS $$
++    BEGIN RAISE EXCEPTION 'injected magic failure'; END $$`);
++  await pool.query("CREATE TRIGGER reject_magic BEFORE UPDATE ON identity_magic_links FOR EACH ROW EXECUTE FUNCTION reject_magic()");
++  await assert.rejects(store.consumeMagicLinkToken("", magic.token, { nowSeconds: now }), /injected magic failure/);
++  assert.equal((await pool.query("SELECT used_at FROM identity_magic_links")).rows[0].used_at, null);
++  await pool.query("DROP TRIGGER reject_magic ON identity_magic_links");
++  const tokens = await Promise.allSettled(Array.from({ length: 20 }, () => store.consumeMagicLinkToken("", magic.token, { nowSeconds: now })));
++  assert.equal(tokens.filter((result) => result.status === "fulfilled").length, 1);
++  assert.equal(tokens.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++  const result = tokens.find((item) => item.status === "fulfilled").value;
++  assert.deepEqual(result, { email: "player@example.test", profileId: "profile", gameId: "game", usedByProfileId: "profile", usedAt: now });
++}));
++
++it("real local PostgreSQL: IAP merge rollback, repeated merges and writer exclusion", testOptions, () => withDatabase(async (pool) => {
++  const store = new PostgresIapStore({ pool });
++  await store.init();
++  await store.addCoins("primary", "game", 10);
++  await store.addCoins("secondary", "game", 50);
++  await store.upsertSubscription("secondary", { provider: "apple", active: true, status: "active", expiresAt: 1_900_000_000 });
++  await pool.query(`CREATE FUNCTION reject_subscription() RETURNS trigger LANGUAGE plpgsql AS $$
++    BEGIN RAISE EXCEPTION 'injected subscription failure'; END $$`);
++  await pool.query("CREATE TRIGGER reject_subscription BEFORE INSERT OR UPDATE ON iap_subscriptions FOR EACH ROW EXECUTE FUNCTION reject_subscription()");
++  await assert.rejects(store.mergeProfiles("primary", "secondary"), /injected subscription failure/);
++  assert.equal((await store.getCoins("primary")).game.balance, 10);
++  assert.equal((await store.getCoins("secondary")).game.balance, 50);
++  assert.equal((await store.getSubscription("secondary")).active, true);
++  await pool.query("DROP TRIGGER reject_subscription ON iap_subscriptions");
++  const results = await Promise.all(Array.from({ length: 20 }, () => store.mergeProfiles("primary", "secondary")));
++  assert.ok(results.every((result) => result.merged));
++  assert.equal((await store.getCoins("primary")).game.balance, 60);
++  assert.equal((await store.getCoins("secondary")).game.balance, 0);
++  assert.equal((await store.getSubscription("primary")).active, true);
++  assert.equal((await store.getSubscription("secondary")).status, "merged");
++
++  // Pause a merge immediately after its real table lock. A separate ordinary
++  // UPDATE must time out instead of changing a wallet during the merge.
++  let entered, resume;
++  const started = new Promise((resolve) => { entered = resolve; });
++  const gate = new Promise((resolve) => { resume = resolve; });
++  const paused = new PostgresIapStore({ pool: {
++    query: pool.query.bind(pool),
++    async connect() {
++      const client = await pool.connect();
++      return {
++        async query(sql, params) {
++          const result = await client.query(sql, params);
++          if (sql.startsWith("LOCK TABLE iap_coin_balances")) { entered(); await gate; }
++          return result;
++        },
++        release: client.release.bind(client)
++      };
++    }
++  } });
++  const merge = paused.mergeProfiles("primary", "secondary");
++  await started;
++  const writer = await pool.connect();
++  try {
++    await writer.query("BEGIN");
++    await writer.query("SET LOCAL lock_timeout = '100ms'");
++    await assert.rejects(writer.query("UPDATE iap_coin_balances SET balance = balance + 1 WHERE profile_id = 'secondary'"), /lock timeout/);
++  } finally {
++    try { await writer.query("ROLLBACK"); }
++    finally { writer.release(); resume(); }
++  }
++  await merge;
++  await store.addCoins("secondary", "game", 1);
++  assert.equal((await store.getCoins("secondary")).game.balance, 1);
++  // Late writes are preserved, not redirected by this local-store patch.
++}));
+diff --git a/test/postgres-consumption.test.js b/test/postgres-consumption.test.js
+new file mode 100644
+index 0000000..4eca95e
+--- /dev/null
++++ b/test/postgres-consumption.test.js
+@@ -0,0 +1,222 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { withPostgresTransaction } from "../packages/shared-utils/index.js";
++import { InMemoryIdentityStore, PostgresIdentityStore } from "../services/identity-gateway/index.js";
++import { PostgresIapStore } from "../services/iap-service/index.js";
++
++// These scripted clients validate SQL and client ownership, not PostgreSQL locks.
++function fixture(Store, steps) {
++  const releases = [];
++  const events = [];
++  const client = {
++    async query(sql, params) {
++      const text = sql.replace(/\s+/g, " ").trim();
++      events.push(text);
++      const step = steps.shift();
++      assert.ok(step, `unexpected SQL: ${text}`);
++      assert.match(text, step.sql);
++      step.check?.(params);
++      if (step.error) throw step.error;
++      return { rows: step.rows || [] };
++    },
++    release(error) { releases.push(error); }
++  };
++  const pool = {
++    async connect() { return client; },
++    async query() { throw new Error("transaction escaped to pool.query"); }
++  };
++  return { store: Store ? new Store({ pool }) : null, pool, steps, releases, events };
++}
++const begin = { sql: /^BEGIN$/ };
++const commit = { sql: /^COMMIT$/ };
++const rollback = { sql: /^ROLLBACK$/ };
++const codeRow = { primary_profile_id: "primary", created_at: 100, expires_at: 1000, used_at: null };
++const codeSelect = { sql: /FROM identity_merge_codes.*LIMIT 1 FOR UPDATE/, rows: [codeRow] };
++const edgeLock = { sql: /^LOCK TABLE identity_merges IN SHARE ROW EXCLUSIVE MODE$/ };
++const resolve = { sql: /^SELECT primary_profile_id FROM identity_merges/ };
++const codeUse = { sql: /^UPDATE identity_merge_codes.*used_at IS NULL.*RETURNING code_hash/, rows: [{ code_hash: "hash" }] };
++const mergeEdge = { sql: /^INSERT INTO identity_merges/ };
++const magicRow = { email: "player@example.test", profile_id: "profile", game_id: "game", expires_at: 1000, used_at: null };
++const magicSelect = { sql: /FROM identity_magic_links.*LIMIT 1 FOR UPDATE/, rows: [magicRow] };
++const magicUse = { sql: /^UPDATE identity_magic_links.*used_at IS NULL.*RETURNING token_hash/, rows: [{ token_hash: "hash" }] };
++const coinLock = { sql: /^LOCK TABLE iap_coin_balances, iap_subscriptions IN SHARE ROW EXCLUSIVE MODE$/ };
++const coinRead = { sql: /^SELECT game_id, balance FROM iap_coin_balances/, rows: [{ game_id: "game", balance: 50 }] };
++const coinCredit = { sql: /^INSERT INTO iap_coin_balances/, check: (params) => assert.deepEqual(params, ["primary", "game", 50]) };
++const coinClear = { sql: /^UPDATE iap_coin_balances SET balance = 0/ };
++const subRead = { sql: /^SELECT provider, external_subscription_id, status, active, expires_at FROM iap_subscriptions/ };
++const subWrite = { sql: /^INSERT INTO iap_subscriptions/ };
++
++function assertFinished(f) {
++  assert.equal(f.steps.length, 0);
++  assert.deepEqual(f.releases, [undefined]);
++}
++
++describe("checked-out PostgreSQL transaction ownership (scripted clients)", () => {
++  it("commits and releases on success", async () => {
++    const f = fixture(null, [begin, { sql: /^SELECT 1$/ }, commit]);
++    assert.equal(await withPostgresTransaction(f.pool, async (client) => { await client.query("SELECT 1"); return "result"; }), "result");
++    assertFinished(f);
++  });
++
++  for (const stage of ["begin", "operation", "commit"]) {
++    it(`preserves ${stage} failure and releases`, async () => {
++      const error = new Error(`${stage} failure`);
++      const sequence = stage === "begin" ? [{ ...begin, error }] : stage === "commit" ? [begin, { ...commit, error }, rollback] : [begin, rollback];
++      const f = fixture(null, sequence);
++      await assert.rejects(withPostgresTransaction(f.pool, async () => { if (stage === "operation") throw error; }), (actual) => actual === error);
++      assert.equal(f.steps.length, 0);
++      assert.deepEqual(f.releases, [stage === "begin" ? error : undefined]);
++    });
++  }
++
++  it("preserves original error and discards client if rollback fails", async () => {
++    const error = new Error("original");
++    const rollbackError = new Error("connection lost");
++    const f = fixture(null, [begin, { ...rollback, error: rollbackError }]);
++    await assert.rejects(withPostgresTransaction(f.pool, async () => { throw error; }), (actual) => actual === error);
++    assert.deepEqual(f.releases, [rollbackError]);
++  });
++
++  it("does not release an unacquired client", async () => {
++    const error = new Error("pool unavailable");
++    await assert.rejects(withPostgresTransaction({ connect: async () => { throw error; } }, () => {}), (actual) => actual === error);
++  });
++});
++
++describe("Postgres identity consumption (scripted clients)", () => {
++  it("locks a merge code and resolves canonical IDs on the transaction client", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, codeSelect, edgeLock,
++      { ...resolve, rows: [{ primary_profile_id: "secondary-root" }] }, resolve,
++      { ...resolve, rows: [{ primary_profile_id: "primary-root" }] }, resolve,
++      { ...codeUse, check(params) { assert.equal(params[2], "secondary-root"); } },
++      { ...mergeEdge, check(params) { assert.deepEqual(params, ["secondary-root", "primary-root", 200]); } }, commit]);
++    assert.deepEqual(await f.store.redeemMergeCode("secondary", "test-code", { nowSeconds: 200 }), { primaryProfileId: "primary-root", secondaryProfileId: "secondary-root", mergedAt: 200 });
++    assertFinished(f);
++  });
++
++  it("consumes a public magic link without changing its response fields", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, magicSelect, magicUse, commit]);
++    assert.deepEqual(await f.store.consumeMagicLinkToken("", "test-token", { nowSeconds: 200 }), { email: "player@example.test", profileId: "profile", gameId: "game", usedByProfileId: "profile", usedAt: 200 });
++    assertFinished(f);
++  });
++
++  for (const [label, method, select, row] of [
++    ["merge code", "redeemMergeCode", codeSelect, codeRow],
++    ["magic link token", "consumeMagicLinkToken", magicSelect, magicRow]
++  ]) {
++    for (const [reason, replacement] of [["not found", null], ["already used", { ...row, used_at: 0 }], ["expired", { ...row, expires_at: 199 }]]) {
++      it(`rejects ${reason} ${label} and rolls back/releases`, async () => {
++        const f = fixture(PostgresIdentityStore, [begin, { ...select, rows: replacement ? [replacement] : [] }, rollback]);
++        await assert.rejects(f.store[method]("secondary", "test-value", { nowSeconds: 200 }), new RegExp(reason));
++        assertFinished(f);
++      });
++    }
++  }
++
++  it("self merge is rejected without consuming the code", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, codeSelect, edgeLock, resolve, resolve, rollback]);
++    await assert.rejects(f.store.redeemMergeCode("primary", "code", { nowSeconds: 200 }), /itself/);
++    assertFinished(f);
++  });
++
++  it("empty profile validation rolls back a magic link before consumption", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, { ...magicSelect, rows: [{ ...magicRow, profile_id: "" }] }, rollback]);
++    await assert.rejects(f.store.consumeMagicLinkToken("", "token", { nowSeconds: 200 }), /missing profile/);
++    assertFinished(f);
++  });
++
++  it("defensively rejects a lost conditional consume", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, magicSelect, { ...magicUse, rows: [] }, rollback]);
++    await assert.rejects(f.store.consumeMagicLinkToken("", "token", { nowSeconds: 200 }), /already used/);
++    assertFinished(f);
++  });
++
++  it("rolls back code consumption if writing the merge edge fails", async () => {
++    const error = new Error("edge write failed");
++    const f = fixture(PostgresIdentityStore, [begin, codeSelect, edgeLock, resolve, resolve, codeUse, { ...mergeEdge, error }, rollback]);
++    await assert.rejects(f.store.redeemMergeCode("secondary", "code", { nowSeconds: 200 }), (actual) => actual === error);
++    assertFinished(f);
++  });
++
++  it("rolls back token update failure", async () => {
++    const error = new Error("consume failed");
++    const f = fixture(PostgresIdentityStore, [begin, magicSelect, { ...magicUse, error }, rollback]);
++    await assert.rejects(f.store.consumeMagicLinkToken("", "token", { nowSeconds: 200 }), (actual) => actual === error);
++    assertFinished(f);
++  });
++});
++
++describe("Postgres IAP profile merge (scripted clients)", () => {
++  it("locks writers and keeps transfer and all subscription helpers on one client", async () => {
++    const f = fixture(PostgresIapStore, [begin, coinLock, coinRead, coinCredit, coinClear, subRead,
++      { ...subRead, rows: [{ provider: "apple", active: true, status: "active", expires_at: "2030-01-01T00:00:00Z" }] },
++      { ...subWrite, check(params) { assert.equal(params[0], "primary"); assert.equal(params[4], true); } },
++      { ...subWrite, check(params) { assert.equal(params[0], "secondary"); assert.equal(params[3], "merged"); assert.equal(params[4], false); } }, commit]);
++    assert.deepEqual(await f.store.mergeProfiles("primary", "secondary"), { merged: true });
++    assertFinished(f);
++  });
++
++  for (const stage of ["credit", "clear", "subscription"]) {
++    it(`rolls back complete merge on ${stage} failure`, async () => {
++      const error = new Error(`${stage} failed`);
++      const prefix = [begin, coinLock, coinRead];
++      const steps = stage === "credit" ? [...prefix, { ...coinCredit, error }] : stage === "clear" ? [...prefix, coinCredit, { ...coinClear, error }] : [...prefix, coinCredit, coinClear, subRead, subRead, { ...subWrite, error }];
++      const f = fixture(PostgresIapStore, [...steps, rollback]);
++      await assert.rejects(f.store.mergeProfiles("primary", "secondary"), (actual) => actual === error);
++      assertFinished(f);
++    });
++  }
++
++  it("does not connect for an invalid/self pair", async () => {
++    const f = fixture(PostgresIapStore, []);
++    assert.deepEqual(await f.store.mergeProfiles("primary", "primary"), { merged: false });
++    assert.deepEqual(await f.store.mergeProfiles("", "secondary"), { merged: false });
++    assert.deepEqual(f.releases, []);
++  });
++});
++
++describe("in-memory identity single-use parity", () => {
++  it("allows exactly one concurrent merge-code redemption", async () => {
++    const store = new InMemoryIdentityStore();
++    const { code } = await store.createMergeCode("primary", { nowSeconds: 100 });
++    const results = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => store.redeemMergeCode(`secondary-${i}`, code, { nowSeconds: 200 })));
++    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
++    assert.equal(results.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++  });
++
++  it("allows exactly one concurrent public magic-link consumption", async () => {
++    const store = new InMemoryIdentityStore();
++    const { token } = await store.createMagicLinkToken("p@example.test", "profile", { nowSeconds: 100 });
++    const results = await Promise.allSettled(Array.from({ length: 20 }, () => store.consumeMagicLinkToken("", token, { nowSeconds: 200 })));
++    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
++    assert.equal(results.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++  });
++
++  it("rejects token reuse even when a test clock records usedAt zero", async () => {
++    const store = new InMemoryIdentityStore();
++    const { token } = await store.createMagicLinkToken("p@example.test", "profile", { nowSeconds: 0 });
++    await store.consumeMagicLinkToken("", token, { nowSeconds: 0 });
++    await assert.rejects(store.consumeMagicLinkToken("", token, { nowSeconds: 0 }), /already used/);
++  });
++
++  it("rejects code reuse even when a test clock records usedAt zero", async () => {
++    const store = new InMemoryIdentityStore();
++    const { code } = await store.createMergeCode("primary", { nowSeconds: 0 });
++    await store.redeemMergeCode("secondary", code, { nowSeconds: 0 });
++    await assert.rejects(store.redeemMergeCode("another", code, { nowSeconds: 0 }), /already used/);
++  });
++
++  it("does not consume a token on missing-profile validation failure", async () => {
++    const store = new InMemoryIdentityStore();
++    const { token } = await store.createMagicLinkToken("p@example.test", "", { nowSeconds: 100 });
++    await assert.rejects(store.consumeMagicLinkToken("", token, { nowSeconds: 200 }), /missing profile/);
++    assert.equal((await store.consumeMagicLinkToken("profile", token, { nowSeconds: 200 })).usedByProfileId, "profile");
++  });
++
++  it("does not consume a merge code on invalid-pair validation failure", async () => {
++    const store = new InMemoryIdentityStore();
++    const { code } = await store.createMergeCode("primary", { nowSeconds: 100 });
++    await assert.rejects(store.redeemMergeCode("", code, { nowSeconds: 200 }), /invalid merge pair/);
++    assert.equal((await store.redeemMergeCode("secondary", code, { nowSeconds: 200 })).primaryProfileId, "primary");
++  });
++});
+-- 
+2.39.3 (Apple Git-145)
+

@@ -1,0 +1,189 @@
+From 80063e2668149bd9db3bfb3be939cd3733bd00e0 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Wed, 21 Oct 2026 01:23:28 -0500
+Subject: [PATCH] Preserve deployed ingress guard and isolate staging gateway
+ release
+
+---
+ .github/workflows/cloudrun-deploy.yml       |  3 +-
+ services/identity-gateway/README.md         | 25 +++++++++++++++
+ services/identity-gateway/src/httpServer.js | 34 +++++++++++++++++++-
+ services/identity-gateway/src/main.js       |  2 ++
+ test/identity-edge-ingress.test.js          | 35 +++++++++++++++++++++
+ 5 files changed, 97 insertions(+), 2 deletions(-)
+ create mode 100644 test/identity-edge-ingress.test.js
+
+diff --git a/.github/workflows/cloudrun-deploy.yml b/.github/workflows/cloudrun-deploy.yml
+index d4a81c7..a0f2d55 100644
+--- a/.github/workflows/cloudrun-deploy.yml
++++ b/.github/workflows/cloudrun-deploy.yml
+@@ -2,7 +2,8 @@ name: Cloud Run Deploy
+ 
+ on:
+   push:
+-    branches: ["main"]
++    # Main is the release source; staging deployments are selected explicitly.
++    # Avoid a gateway merge automatically deploying every manifest service.
+     tags: ["v*"]
+   workflow_dispatch:
+     inputs:
+diff --git a/services/identity-gateway/README.md b/services/identity-gateway/README.md
+index 2e78231..3252e55 100644
+--- a/services/identity-gateway/README.md
++++ b/services/identity-gateway/README.md
+@@ -170,3 +170,28 @@ not trigger the checked-in deployment workflows. Tag/manual workflows do not
+ currently enforce ancestry from main; release operators must select a reviewed
+ main revision. No merge, tag, workflow dispatch, deployment, or live configuration
+ change is part of this patch.
++
++### Staging replacement: preserve deployed edge ingress
++
++The staging image identified by digest
++`sha256:c872c6454424a39e2b04161812985e2073bfd3c418aad71aac31895f7829d0a6`
++contains an ingress guard absent from repository history. The replacement preserves
++its recovered implementation: when `EDGE_INGRESS_SECRET` is configured,
++`x-terapixel-origin-secret` is required outside health/JWKS and the existing
++`/v1/identity/internal/` exemption. Those internal routes still require their admin
++key. OPTIONS handling and public web/magic-link behavior through the trusted edge
++remain unchanged. Secret comparisons use the recovered constant-time helper.
++No runtime secret values were recovered from the image or added to this repository.
++
++This origin proof is distinct from `x-nakama-exchange-key`: backend exchanges must
++satisfy both existing ingress policy and the dedicated backend proof. Global player
++sessions remain intentional; no consumer game_id rejection is included. Without
++approved exchange-key configuration, Nakama exchange remains fail-closed.
++
++Main pushes no longer trigger the all-service Cloud Run deployment workflow.
++Existing version-tag/manual entrypoints remain; operators must not dispatch that
++workflow for an identity-only release because it deploys every manifest service.
++The scoped staging replacement targets only `terapixel-identity-gateway` in
++`terapixel-platform-staging`, `us-central1`, from reviewed main, using an image-only
++service update preserving existing runtime identity, environment, secret references,
++IAM and ingress settings. Record the old revision/digest before any deployment.
+diff --git a/services/identity-gateway/src/httpServer.js b/services/identity-gateway/src/httpServer.js
+index 2890f42..fdca009 100644
+--- a/services/identity-gateway/src/httpServer.js
++++ b/services/identity-gateway/src/httpServer.js
+@@ -90,6 +90,7 @@ export function createIdentityGatewayHttpServer(options = {}) {
+       await handleRequest(req, res, {
+         service,
+         authConfig,
++        edgeIngressSecret: String(options.edgeIngressSecret || "").trim(),
+         internalServiceKey: String(options.internalServiceKey || ""),
+         sessionConfig,
+         sessionVerifier,
+@@ -149,6 +150,11 @@ async function handleRequest(req, res, ctx) {
+     return;
+   }
+ 
++  requireEdgeIngress(req, urlPath, {
++    expected: ctx.edgeIngressSecret,
++    sessionJwksPath: ctx.sessionJwksPath
++  });
++
+   if (req.method === "GET" && urlPath === "/v1/web/session") {
+     const sessionToken = extractSessionCookie(
+       req,
+@@ -604,11 +610,37 @@ function requireAdminKey(req, expectedKey) {
+     throw new HttpError(500, "config_error", "internal service key not configured");
+   }
+   const provided = String(req.headers["x-admin-key"] || "").trim();
+-  if (!provided || provided !== expected) {
++  if (!provided || !timingSafeEquals(provided, expected)) {
+     throw new HttpError(401, "unauthorized", "invalid admin key");
+   }
+ }
+ 
++function requireEdgeIngress(req, urlPath, options = {}) {
++  const expected = String(options.expected || "").trim();
++  if (!expected) {
++    return;
++  }
++  if (urlPath === "/healthz" || urlPath === String(options.sessionJwksPath || "")) {
++    return;
++  }
++  if (urlPath.startsWith("/v1/identity/internal/")) {
++    return;
++  }
++  const provided = String(req.headers["x-terapixel-origin-secret"] || "").trim();
++  if (!provided || !timingSafeEquals(provided, expected)) {
++    throw new HttpError(403, "forbidden", "missing or invalid edge ingress secret");
++  }
++}
++
++function timingSafeEquals(left, right) {
++  const leftBytes = Buffer.from(String(left || ""), "utf8");
++  const rightBytes = Buffer.from(String(right || ""), "utf8");
++  if (leftBytes.length !== rightBytes.length) {
++    return false;
++  }
++  return crypto.timingSafeEqual(leftBytes, rightBytes);
++}
++
+ function extractProfileIdFromClaims(claims, sessionConfig = {}) {
+   if (!claims || typeof claims !== "object") {
+     return "";
+diff --git a/services/identity-gateway/src/main.js b/services/identity-gateway/src/main.js
+index 7c227be..299979d 100644
+--- a/services/identity-gateway/src/main.js
++++ b/services/identity-gateway/src/main.js
+@@ -76,6 +76,7 @@ async function main() {
+     service,
+     bodyLimitBytes: config.bodyLimitBytes,
+     allowedOrigins: config.allowedOrigins,
++    edgeIngressSecret: config.edgeIngressSecret,
+     sessionSecret: config.sessionSecret,
+     sessionSigningAlg: config.sessionSigningAlg,
+     sessionSigningKeyId: config.sessionSigningKeyId,
+@@ -168,6 +169,7 @@ function readConfig(env) {
+       "https://sdk.crazygames.com/authentication/",
+     expectedAudience: requiredEnv(env, "CRAZYGAMES_EXPECTED_AUDIENCE"),
+     allowedOrigins: env.CORS_ALLOWED_ORIGINS || "",
++    edgeIngressSecret: String(env.EDGE_INGRESS_SECRET || "").trim(),
+     jwksTtlSeconds: parseIntWithDefault(env.JWKS_TTL_SECONDS, 600),
+     clockSkewSeconds: parseIntWithDefault(env.CLOCK_SKEW_SECONDS, 10),
+     sessionSecret,
+diff --git a/test/identity-edge-ingress.test.js b/test/identity-edge-ingress.test.js
+new file mode 100644
+index 0000000..4cd1c6f
+--- /dev/null
++++ b/test/identity-edge-ingress.test.js
+@@ -0,0 +1,35 @@
++import { it } from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import { createIdentityGatewayHttpServer, createIdentityGatewayService } from '../services/identity-gateway/index.js';
++
++it('preserves deployed edge guard, its exemptions and backend-proof requirement', async()=>{
++ const service=createIdentityGatewayService({nakamaExchangeKeysJson:JSON.stringify({game:'fixed-local-backend-test-key-32-bytes'}),sessionSecret:'fixed-local-session-test-secret'});
++ const server=createIdentityGatewayHttpServer({service,sessionSecret:'fixed-local-session-test-secret',edgeIngressSecret:'fixed-local-origin-fixture',internalServiceKey:'fixed-local-admin-fixture'});
++ const {baseUrl}=await server.listen();
++ const send=(path,{method='GET',headers={},body}={})=>fetch(baseUrl+path,{method,headers:{'content-type':'application/json',...headers},...(body?{body:JSON.stringify(body)}:{})});
++ try{
++  assert.equal((await send('/healthz?probe=1')).status,200);
++  assert.equal((await send('/.well-known/jwks.json?probe=1')).status,200);
++  assert.equal((await send('/v1/auth/nakama',{method:'OPTIONS'})).status,204);
++  for(const supplied of [null,'wrong','x'.repeat(26)]) {
++   const res=await send('/v1/web/session',{headers:supplied?{'x-terapixel-origin-secret':supplied}:{}});
++   assert.equal(res.status,403);assert.equal((await res.json()).error.message,'missing or invalid edge ingress secret');
++  }
++  const origin={'x-terapixel-origin-secret':'fixed-local-origin-fixture'};
++  assert.equal((await send('/v1/web/session',{headers:origin})).status,200);
++  assert.equal((await send('/v1/account/magic-link/consume')).status,403);
++  assert.equal((await send('/v1/account/magic-link/consume',{headers:origin})).status,400);
++  assert.equal((await send('/v1/auth/nakama',{method:'POST',headers:origin,body:{game_id:'game',nakama_user_id:'player'}})).status,401);
++  assert.equal((await send('/v1/auth/nakama',{method:'POST',headers:{...origin,'x-nakama-exchange-key':'fixed-local-backend-test-key-32-bytes'},body:{game_id:'game',nakama_user_id:'player'}})).status,200);
++  assert.equal((await send('/v1/identity/internal/username/validate',{method:'POST',body:{game_id:'game',username:'player'}})).status,401);
++  assert.equal((await send('/v1/identity/internal/username/validate',{method:'POST',headers:{'x-admin-key':'fixed-local-admin-fixture'},body:{game_id:'game',username:'player'}})).status,200);
++ }finally{await server.close()}
++});
++it('gateway main merges cannot trigger the all-service staging deployment',()=>{
++ const workflow=fs.readFileSync(new URL('../.github/workflows/cloudrun-deploy.yml',import.meta.url),'utf8');
++ const triggers=workflow.split('permissions:')[0];
++ assert.doesNotMatch(triggers,/branches:\s*\["main"\]/);
++ assert.match(triggers,/tags:\s*\["v\*"\]/);
++ assert.match(triggers,/workflow_dispatch:/);
++});
+-- 
+2.39.3 (Apple Git-145)
+

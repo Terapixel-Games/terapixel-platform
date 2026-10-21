@@ -1,0 +1,1089 @@
+From 728cc043f5fa7bc75f133ac581558da8bfdaac8c Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:37:36 -0500
+Subject: [PATCH] Prevent concurrent cloud save overwrite with conditional
+ retries
+
+---
+ services/save-service/README.md               |  63 +++++++-
+ services/save-service/index.js                |   1 +
+ services/save-service/src/httpServer.js       |  28 ++--
+ .../save-service/src/postgresSaveStore.js     |  50 ++++++
+ services/save-service/src/saveConcurrency.js  |  22 +++
+ services/save-service/src/saveEnvelope.js     |  36 +++--
+ services/save-service/src/saveErrors.js       |   8 +
+ services/save-service/src/saveService.js      | 127 ++++++---------
+ services/save-service/src/saveStore.js        | 150 +++++++++---------
+ test/postgres-save-concurrency.test.js        |  57 +++++++
+ test/postgres-save-integration.test.js        |  63 ++++++++
+ test/save-concurrency-http.test.js            |  37 +++++
+ test/save-concurrency.test.js                 | 145 +++++++++++++++++
+ 13 files changed, 596 insertions(+), 191 deletions(-)
+ create mode 100644 services/save-service/src/saveConcurrency.js
+ create mode 100644 services/save-service/src/saveErrors.js
+ create mode 100644 test/postgres-save-concurrency.test.js
+ create mode 100644 test/postgres-save-integration.test.js
+ create mode 100644 test/save-concurrency-http.test.js
+ create mode 100644 test/save-concurrency.test.js
+
+diff --git a/services/save-service/README.md b/services/save-service/README.md
+index f6be82e..72f6d21 100644
+--- a/services/save-service/README.md
++++ b/services/save-service/README.md
+@@ -19,7 +19,7 @@ Purpose: authenticated cloud-save synchronization for game clients.
+ - `PostgresSaveStore`: shared durable store for multi-instance deployments.
+ 
+ Production note:
+-- For multi-instance horizontal scale, implement a shared DB-backed store adapter.
++- Use `PostgresSaveStore` for multi-instance deployments. Memory and JSON-file stores are single-process adapters; two processes must never share a JSON file.
+ 
+ ## Run
+ - `npm run start:save`
+@@ -57,3 +57,64 @@ Optional env:
+ 
+ When `PLATFORM_CONFIG_STORE_TYPE` is not `none`, `game_id` must be an onboarded active title
+ in control-plane for save read/write requests.
++
++
++## Revision-safe writes and migration
++
++Sync reads a snapshot, merges the original client envelope, and writes only if
++that snapshot still matches. PostgreSQL uses `INSERT ... ON CONFLICT DO NOTHING`
++for absent rows and a conditional `UPDATE` for existing rows (revision and JSONB
++snapshot equality). Memory/file adapters perform the same check in their mutation
++critical section. Snapshot matching also rejects deletion/recreation with a reused
++revision and different content. A losing request rereads and remerges rather than
++retrying a stale computed write. No database schema migration is required.
++
++The service defaults to five write attempts; `maxWriteAttempts` is a constructor-only
++integer from 1 through 20. Exhaustion returns HTTP 409 with
++`error.code = "save_conflict"`, `retryable: true`, and the latest `envelope` (possibly
++null). Clients should retain their local save and retry with backoff. Successful
++response fields and source values are unchanged. Malformed envelope metadata,
++including string/fractional/unsafe revisions or schema versions, returns 422;
++unexpected storage failures return 500 rather than masquerading as validation errors.
++Previously persisted malformed metadata needs offline inspection/correction before
++rollout; this patch does not silently coerce it.
++
++Custom adapters must implement `compareAndSwap(envelope, expectedRevision,
++expectedEnvelope)` and return `{ applied: true, envelope }` or `{ applied: false }`.
++Null expected revision/snapshot means absent. Existing-row writes must atomically
++check both supplied revision and snapshot. `put` remains an explicit unconditional
++replacement API for setup/legacy compatibility; concurrent sync must never use it.
++Profile migration additionally requires `listByProfile` and `migrateProfileGame`.
++All built-in adapters implement these contracts. JSON mutations stage a complete
++snapshot, rename the file, then publish memory state; failed persistence leaves the
++committed state intact and the queue usable. Atomic rename does not provide fsync
++power-loss durability or cross-process locking.
++
++Per-game profile migration atomically writes the combined destination and removes
++the source. PostgreSQL uses one checked-out client and sorted row locks throughout,
++with rollback/release on error. Missing destination insert races roll back and retry
++from fresh rows. This orders locks consistently for current migration paths without
++a table-wide writer lock. Lock latency/deadlock behavior still needs real PostgreSQL
++validation. Multi-game migration can finish earlier games before a later failure;
++it is not a cross-game or cross-service saga. A late secondary-profile save can
++recreate secondary data; canonical redirection/resumable orchestration is separate
++work. The existing merge policy is preserved: known progress counters use maxima,
++unknown keys are retained and the fresher envelope wins conflicts. This does not
++sum independent increments or implement arbitrary field CRDTs.
++
++## Local verification and release gate
++
++Run the Node 20 suite with `node --test`. Tests include deterministic simultaneous
++first/existing saves, remerge retries, reused-revision snapshots, bounded contention,
++file failure recovery, migration races, route responses, and scripted PostgreSQL
++transaction/SQL checks. Scripted checks are not engine integration coverage.
++
++`test/postgres-save-integration.test.js` is opt-in with
++`SAVE_TEST_LOCAL_DATABASE_URL` pointing to an approved, already-running disposable
++loopback PostgreSQL database. It creates/drops an isolated schema and verifies real
++concurrent CAS and migration rollback via an injected delete failure. URL query
++overrides are rejected and `DATABASE_URL` is never used as a fallback. Database
++startup approval is pending; these tests have not run and remain a release gate.
++No database, deployment, credential or live configuration changes are part of this
++patch. This local branch depends on integrated review commit `90feb4d` for the shared
++pinned-client transaction helper; it is not a standalone patch against original main.
+diff --git a/services/save-service/index.js b/services/save-service/index.js
+index f301121..76e42f3 100644
+--- a/services/save-service/index.js
++++ b/services/save-service/index.js
+@@ -8,3 +8,4 @@ export { createSaveService } from "./src/saveService.js";
+ export { InMemorySaveStore, JsonFileSaveStore } from "./src/saveStore.js";
+ export { PostgresSaveStore } from "./src/postgresSaveStore.js";
+ export { createSaveHttpServer } from "./src/httpServer.js";
++export { SaveConflictError, SaveValidationError } from "./src/saveErrors.js";
+diff --git a/services/save-service/src/httpServer.js b/services/save-service/src/httpServer.js
+index d1644d5..bb0f718 100644
+--- a/services/save-service/src/httpServer.js
++++ b/services/save-service/src/httpServer.js
+@@ -1,5 +1,6 @@
+ import http from "node:http";
+ import crypto from "node:crypto";
++import { SaveConflictError, SaveValidationError } from "./saveErrors.js";
+ import {
+   JwtValidationError,
+   createSessionTokenVerifier
+@@ -70,6 +71,11 @@ export function createSaveHttpServer(options = {}) {
+         requestId
+       });
+     } catch (error) {
++      if (error instanceof SaveConflictError) {
++        writeJson(res, 409, { request_id: requestId, error: { code: "save_conflict", message: error.message }, envelope: error.envelope, retryable: true });
++        return;
++      }
++      if (error instanceof SaveValidationError) error = new HttpError(422, "invalid_request", error.message);
+       if (error instanceof HttpError) {
+         writeJson(res, error.statusCode, {
+           request_id: requestId,
+@@ -135,22 +141,14 @@ async function handleRequest(req, res, ctx) {
+       throw new HttpError(400, "invalid_request", "game_id is required");
+     }
+ 
+-    const clientEnvelope =
+-      body.client_envelope && typeof body.client_envelope === "object"
+-        ? body.client_envelope
+-        : null;
++    const clientEnvelope = body.client_envelope ?? null;
+ 
+-    let result;
+-    try {
+-      result = await ctx.service.syncSave({
+-        gameId,
+-        profileId,
+-        clientEnvelope,
+-        nowSeconds: body.now_seconds
+-      });
+-    } catch (error) {
+-      throw new HttpError(422, "invalid_request", error.message);
+-    }
++    const result = await ctx.service.syncSave({
++      gameId,
++      profileId,
++      clientEnvelope,
++      nowSeconds: body.now_seconds
++    });
+ 
+     writeJson(res, 200, {
+       request_id: ctx.requestId,
+diff --git a/services/save-service/src/postgresSaveStore.js b/services/save-service/src/postgresSaveStore.js
+index 1733d09..062b63a 100644
+--- a/services/save-service/src/postgresSaveStore.js
++++ b/services/save-service/src/postgresSaveStore.js
+@@ -1,7 +1,13 @@
++import { withPostgresTransaction } from "../../../packages/shared-utils/index.js";
++import { validateCompareAndSwap, migrateSaveEnvelope } from "./saveConcurrency.js";
++import { validateSaveEnvelope } from "./saveEnvelope.js";
++import { SaveConflictError } from "./saveErrors.js";
++
+ export class PostgresSaveStore {
+   constructor(options = {}) {
+     this._pool = options.pool;
+     this._tableName = String(options.tableName || "save_envelopes");
++    if (!/^[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?$/.test(this._tableName)) throw new Error("invalid save table name");
+     if (!this._pool || typeof this._pool.query !== "function") {
+       throw new Error("PostgresSaveStore requires pool.query");
+     }
+@@ -35,6 +41,7 @@ export class PostgresSaveStore {
+   }
+ 
+   async put(envelope) {
++    validateSaveEnvelope(envelope);
+     const sql = `
+       INSERT INTO ${this._tableName} (game_id, profile_id, envelope, updated_at)
+       VALUES ($1, $2, $3::jsonb, NOW())
+@@ -50,6 +57,49 @@ export class PostgresSaveStore {
+     return result.rows[0].envelope;
+   }
+ 
++  async compareAndSwap(envelope, expectedRevision, expectedEnvelope) {
++    validateCompareAndSwap(envelope, expectedRevision);
++    const params = [envelope.game_id, envelope.profile_id, JSON.stringify(envelope)];
++    const result = expectedRevision === null
++      ? await this._pool.query(
++          `INSERT INTO ${this._tableName} (game_id, profile_id, envelope, updated_at)
++           VALUES ($1, $2, $3::jsonb, NOW()) ON CONFLICT (game_id, profile_id) DO NOTHING RETURNING envelope`, params)
++      : await this._pool.query(
++          `UPDATE ${this._tableName} SET envelope = $3::jsonb, updated_at = NOW()
++           WHERE game_id = $1 AND profile_id = $2 AND (envelope->>'revision')::numeric = $4::numeric
++             ${expectedEnvelope === undefined ? '' : 'AND envelope = $5::jsonb'}
++           RETURNING envelope`, [...params, expectedRevision, ...(expectedEnvelope === undefined ? [] : [JSON.stringify(expectedEnvelope)])]);
++    return result.rows.length ? { applied: true, envelope: result.rows[0].envelope } : { applied: false };
++  }
++
++  async migrateProfileGame(gameId, primaryId, secondaryId, nowSeconds) {
++    if (primaryId === secondaryId) return { migrated: false };
++    if (typeof this._pool.connect !== "function") throw new Error("save migration requires pool.connect");
++    return withPostgresTransaction(this._pool, async (client) => {
++      // Lock existing source/destination rows in a consistent order. Missing
++      // destination rows are protected by INSERT DO NOTHING plus caller retry.
++      const rows = await client.query(
++        `SELECT envelope FROM ${this._tableName}
++         WHERE game_id = $1 AND profile_id IN ($2, $3) ORDER BY profile_id FOR UPDATE`,
++        [gameId, primaryId, secondaryId]);
++      const primary = rows.rows.find((row) => row.envelope.profile_id === primaryId)?.envelope;
++      const secondary = rows.rows.find((row) => row.envelope.profile_id === secondaryId)?.envelope;
++      const merged = migrateSaveEnvelope(primary, secondary, gameId, primaryId, secondaryId, nowSeconds);
++      if (!merged) return { migrated: false };
++      const params = [gameId, primaryId, JSON.stringify(merged)];
++      if (primary) {
++        await client.query(`UPDATE ${this._tableName} SET envelope = $3::jsonb, updated_at = NOW() WHERE game_id = $1 AND profile_id = $2`, params);
++      } else {
++        const inserted = await client.query(
++          `INSERT INTO ${this._tableName} (game_id, profile_id, envelope, updated_at) VALUES ($1, $2, $3::jsonb, NOW())
++           ON CONFLICT (game_id, profile_id) DO NOTHING RETURNING envelope`, params);
++        if (!inserted.rows.length) throw new SaveConflictError();
++      }
++      await client.query(`DELETE FROM ${this._tableName} WHERE game_id = $1 AND profile_id = $2`, [gameId, secondaryId]);
++      return { migrated: true };
++    });
++  }
++
+   async listByProfile(profileId) {
+     const result = await this._pool.query(
+       `SELECT envelope FROM ${this._tableName} WHERE profile_id = $1`,
+diff --git a/services/save-service/src/saveConcurrency.js b/services/save-service/src/saveConcurrency.js
+new file mode 100644
+index 0000000..dab423f
+--- /dev/null
++++ b/services/save-service/src/saveConcurrency.js
+@@ -0,0 +1,22 @@
++import { mergeSaveEnvelopes, validateSaveEnvelope } from "./saveEnvelope.js";
++import { SaveValidationError } from "./saveErrors.js";
++export function validateCompareAndSwap(envelope, expectedRevision) {
++  validateSaveEnvelope(envelope);
++  if (expectedRevision !== null && (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)) {
++    throw new SaveValidationError("expected revision must be null or a positive safe integer");
++  }
++  if (expectedRevision !== null && envelope.revision <= expectedRevision) {
++    throw new SaveValidationError("new save revision must advance");
++  }
++}
++export function migrateSaveEnvelope(primary, secondary, gameId, primaryId, secondaryId, nowSeconds) {
++  if (!secondary) return null;
++  validateSaveEnvelope(secondary);
++  if (secondary.game_id !== gameId || secondary.profile_id !== secondaryId) throw new SaveValidationError("secondary save identity mismatch");
++  if (primary) {
++    validateSaveEnvelope(primary);
++    if (primary.game_id !== gameId || primary.profile_id !== primaryId) throw new SaveValidationError("primary save identity mismatch");
++  }
++  const incoming = { ...secondary, profile_id: primaryId };
++  return primary ? mergeSaveEnvelopes(incoming, primary, { nowSeconds }) : validateSaveEnvelope({ ...incoming, updated_at: Math.max(nowSeconds, incoming.updated_at) });
++}
+diff --git a/services/save-service/src/saveEnvelope.js b/services/save-service/src/saveEnvelope.js
+index 7451dfd..2d03334 100644
+--- a/services/save-service/src/saveEnvelope.js
++++ b/services/save-service/src/saveEnvelope.js
+@@ -1,3 +1,5 @@
++import { SaveValidationError } from "./saveErrors.js";
++
+ export const SAVE_ENVELOPE_SCHEMA_VERSION = 1;
+ 
+ const DEFAULT_PAYLOAD = Object.freeze({
+@@ -19,7 +21,7 @@ export function createDefaultSaveEnvelope(input = {}) {
+     schema_version: SAVE_ENVELOPE_SCHEMA_VERSION,
+     game_id: String(input.gameId || ""),
+     profile_id: String(input.profileId || ""),
+-    revision: normalizeInt(input.revision, 1),
++    revision: input.revision === undefined ? 1 : input.revision,
+     updated_at: now,
+     payload
+   };
+@@ -28,26 +30,26 @@ export function createDefaultSaveEnvelope(input = {}) {
+ }
+ 
+ export function validateSaveEnvelope(envelope) {
+-  if (!envelope || typeof envelope !== "object") {
+-    throw new Error("save envelope must be an object");
++  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
++    throw new SaveValidationError("save envelope must be an object");
+   }
+-  if (normalizeInt(envelope.schema_version, -1) < 1) {
+-    throw new Error("save envelope schema_version must be >= 1");
++  if (!Number.isSafeInteger(envelope.schema_version) || envelope.schema_version < 1) {
++    throw new SaveValidationError("save envelope schema_version must be a positive safe integer");
+   }
+   if (!envelope.game_id || typeof envelope.game_id !== "string") {
+-    throw new Error("save envelope game_id is required");
++    throw new SaveValidationError("save envelope game_id is required");
+   }
+   if (!envelope.profile_id || typeof envelope.profile_id !== "string") {
+-    throw new Error("save envelope profile_id is required");
++    throw new SaveValidationError("save envelope profile_id is required");
+   }
+-  if (normalizeInt(envelope.revision, -1) < 1) {
+-    throw new Error("save envelope revision must be >= 1");
++  if (!Number.isSafeInteger(envelope.revision) || envelope.revision < 1) {
++    throw new SaveValidationError("save envelope revision must be a positive safe integer");
+   }
+-  if (normalizeUnix(envelope.updated_at) <= 0) {
+-    throw new Error("save envelope updated_at must be > 0");
++  if (!Number.isSafeInteger(envelope.updated_at) || envelope.updated_at <= 0) {
++    throw new SaveValidationError("save envelope updated_at must be > 0");
+   }
+-  if (!envelope.payload || typeof envelope.payload !== "object") {
+-    throw new Error("save envelope payload must be an object");
++  if (!envelope.payload || typeof envelope.payload !== "object" || Array.isArray(envelope.payload)) {
++    throw new SaveValidationError("save envelope payload must be an object");
+   }
+   return envelope;
+ }
+@@ -57,10 +59,10 @@ export function mergeSaveEnvelopes(localEnvelope, remoteEnvelope, options = {})
+   validateSaveEnvelope(remoteEnvelope);
+ 
+   if (localEnvelope.game_id !== remoteEnvelope.game_id) {
+-    throw new Error("cannot merge envelopes with different game_id");
++    throw new SaveValidationError("cannot merge envelopes with different game_id");
+   }
+   if (localEnvelope.profile_id !== remoteEnvelope.profile_id) {
+-    throw new Error("cannot merge envelopes with different profile_id");
++    throw new SaveValidationError("cannot merge envelopes with different profile_id");
+   }
+ 
+   const fresher = pickFresherEnvelope(localEnvelope, remoteEnvelope);
+@@ -69,7 +71,7 @@ export function mergeSaveEnvelopes(localEnvelope, remoteEnvelope, options = {})
+   const mergedPayload = mergePayload(fresher.payload, older.payload);
+   const now = normalizeUnix(options.nowSeconds || Math.floor(Date.now() / 1000));
+ 
+-  return {
++  return validateSaveEnvelope({
+     schema_version: Math.max(
+       normalizeInt(localEnvelope.schema_version, 1),
+       normalizeInt(remoteEnvelope.schema_version, 1)
+@@ -83,7 +85,7 @@ export function mergeSaveEnvelopes(localEnvelope, remoteEnvelope, options = {})
+       ) + 1,
+     updated_at: Math.max(now, fresher.updated_at, older.updated_at),
+     payload: mergedPayload
+-  };
++  });
+ }
+ 
+ function pickFresherEnvelope(a, b) {
+diff --git a/services/save-service/src/saveErrors.js b/services/save-service/src/saveErrors.js
+new file mode 100644
+index 0000000..661d435
+--- /dev/null
++++ b/services/save-service/src/saveErrors.js
+@@ -0,0 +1,8 @@
++export class SaveValidationError extends Error {}
++export class SaveConflictError extends Error {
++  constructor(envelope = null) {
++    super("save changed concurrently; retry with the latest envelope");
++    this.envelope = envelope;
++    this.retryable = true;
++  }
++}
+diff --git a/services/save-service/src/saveService.js b/services/save-service/src/saveService.js
+index bfddaf8..52a50c0 100644
+--- a/services/save-service/src/saveService.js
++++ b/services/save-service/src/saveService.js
+@@ -3,11 +3,15 @@ import {
+   mergeSaveEnvelopes,
+   validateSaveEnvelope
+ } from "./saveEnvelope.js";
++import { SaveConflictError, SaveValidationError } from "./saveErrors.js";
+ import { InMemorySaveStore } from "./saveStore.js";
+ import { createNoopRuntimeConfigProvider } from "../../../packages/shared-utils/index.js";
+ 
+ export function createSaveService(options = {}) {
+   const saveStore = options.saveStore || new InMemorySaveStore();
++  if (typeof saveStore.compareAndSwap !== "function") throw new Error("saveStore.compareAndSwap is required");
++  const maxWriteAttempts = options.maxWriteAttempts ?? 5;
++  if (!Number.isInteger(maxWriteAttempts) || maxWriteAttempts < 1 || maxWriteAttempts > 20) throw new Error("maxWriteAttempts must be between 1 and 20");
+   const runtimeConfigProvider =
+     options.runtimeConfigProvider || createNoopRuntimeConfigProvider();
+   const runtimeConfigRequired = options.runtimeConfigRequired === true;
+@@ -22,7 +26,7 @@ export function createSaveService(options = {}) {
+         runtimeConfigProvider,
+         runtimeConfigRequired
+       });
+-      return saveStore.get(gameId, profileId);
++      return readServerEnvelope(saveStore, gameId, profileId);
+     },
+     syncSave: async ({ gameId, profileId, clientEnvelope, nowSeconds }) => {
+       assertRequiredString(gameId, "gameId");
+@@ -34,53 +38,26 @@ export function createSaveService(options = {}) {
+       });
+       const now = normalizeNow(nowSeconds);
+ 
+-      const serverEnvelope = await saveStore.get(gameId, profileId);
+-      if (!clientEnvelope && serverEnvelope) {
+-        return {
+-          envelope: serverEnvelope,
+-          source: "server"
+-        };
+-      }
+-
+-      if (!clientEnvelope && !serverEnvelope) {
+-        const created = createDefaultSaveEnvelope({
+-          gameId,
+-          profileId,
+-          updatedAt: now
+-        });
+-        const persisted = await saveStore.put(created);
+-        return {
+-          envelope: persisted,
+-          source: "created_default"
+-        };
+-      }
+-
+-      if (clientEnvelope) {
++      const hasClient = clientEnvelope !== null && clientEnvelope !== undefined;
++      if (hasClient) {
+         validateSaveEnvelope(clientEnvelope);
+         assertEnvelopeIdentity(clientEnvelope, gameId, profileId);
+       }
+-
+-      if (!serverEnvelope && clientEnvelope) {
+-        const firstWrite = {
+-          ...clientEnvelope,
+-          updated_at: Math.max(Number(clientEnvelope.updated_at) || 0, now),
+-          revision: Math.max(1, Number(clientEnvelope.revision) || 1)
+-        };
+-        const persisted = await saveStore.put(firstWrite);
+-        return {
+-          envelope: persisted,
+-          source: "client_first_write"
+-        };
++      for (let attempt = 0; attempt < maxWriteAttempts; attempt++) {
++        const server = await readServerEnvelope(saveStore, gameId, profileId);
++        if (!hasClient && server) return { envelope: server, source: "server" };
++        const source = server ? "merged" : hasClient ? "client_first_write" : "created_default";
++        const candidate = server
++          ? mergeSaveEnvelopes(clientEnvelope, server, { nowSeconds: now })
++          : hasClient
++            ? { ...clientEnvelope, updated_at: Math.max(clientEnvelope.updated_at, now) }
++            : createDefaultSaveEnvelope({ gameId, profileId, updatedAt: now });
++        const result = await saveStore.compareAndSwap(candidate, server?.revision ?? null, server);
++        if (result.applied) return { envelope: result.envelope, source };
++        // Read again and remerge the ORIGINAL client envelope, never overwrite
++        // the winner using a candidate calculated from a stale snapshot.
+       }
+-
+-      const merged = mergeSaveEnvelopes(clientEnvelope, serverEnvelope, {
+-        nowSeconds: now
+-      });
+-      const persisted = await saveStore.put(merged);
+-      return {
+-        envelope: persisted,
+-        source: "merged"
+-      };
++      throw new SaveConflictError(await readServerEnvelope(saveStore, gameId, profileId));
+     },
+     mergeProfiles: async ({ primaryProfileId, secondaryProfileId, nowSeconds }) => {
+       assertRequiredString(primaryProfileId, "primaryProfileId");
+@@ -89,30 +66,24 @@ export function createSaveService(options = {}) {
+         return { merged: false, affected_games: [] };
+       }
+       const now = normalizeNow(nowSeconds);
+-      const secondaryRows = await listByProfile(saveStore, secondaryProfileId);
++      if (typeof saveStore.listByProfile !== "function" || typeof saveStore.migrateProfileGame !== "function") {
++        throw new Error("save store must support atomic per-game profile migration");
++      }
++      const secondaryRows = await saveStore.listByProfile(secondaryProfileId);
+       const affectedGames = [];
+-      for (const secondaryEnvelope of secondaryRows) {
+-        const gameId = String(secondaryEnvelope.game_id || "");
+-        if (!gameId) {
+-          continue;
++      for (const gameId of new Set(secondaryRows.map((row) => row.game_id))) {
++        let finished = false;
++        for (let attempt = 0; attempt < maxWriteAttempts; attempt++) {
++          try {
++            const result = await saveStore.migrateProfileGame(gameId, primaryProfileId, secondaryProfileId, now);
++            if (result.migrated) affectedGames.push(gameId);
++            finished = true;
++            break;
++          } catch (error) {
++            if (!(error instanceof SaveConflictError)) throw error;
++          }
+         }
+-        const primaryEnvelope = await saveStore.get(gameId, primaryProfileId);
+-        const secondaryAsPrimary = {
+-          ...secondaryEnvelope,
+-          profile_id: primaryProfileId
+-        };
+-        const merged = primaryEnvelope
+-          ? mergeSaveEnvelopes(secondaryAsPrimary, primaryEnvelope, {
+-              nowSeconds: now
+-            })
+-          : {
+-              ...secondaryAsPrimary,
+-              revision: Math.max(1, Number(secondaryAsPrimary.revision) || 1),
+-              updated_at: Math.max(now, Number(secondaryAsPrimary.updated_at) || 0)
+-            };
+-        await saveStore.put(merged);
+-        await deleteByGameAndProfile(saveStore, gameId, secondaryProfileId);
+-        affectedGames.push(gameId);
++        if (!finished) throw new SaveConflictError(await readServerEnvelope(saveStore, gameId, primaryProfileId));
+       }
+       return {
+         merged: true,
+@@ -130,13 +101,13 @@ async function assertGameConfigured(input = {}) {
+     gameId: input.gameId
+   });
+   if (!runtimeConfig) {
+-    throw new Error("game_id is not onboarded or is inactive");
++    throw new SaveValidationError("game_id is not onboarded or is inactive");
+   }
+ }
+ 
+ function assertRequiredString(value, fieldName) {
+   if (typeof value !== "string" || !value.trim()) {
+-    throw new Error(`${fieldName} is required`);
++    throw new SaveValidationError(`${fieldName} is required`);
+   }
+ }
+ 
+@@ -149,22 +120,18 @@ function normalizeNow(nowSeconds) {
+ 
+ function assertEnvelopeIdentity(envelope, gameId, profileId) {
+   if (envelope.game_id !== gameId) {
+-    throw new Error("client envelope game_id mismatch");
++    throw new SaveValidationError("client envelope game_id mismatch");
+   }
+   if (envelope.profile_id !== profileId) {
+-    throw new Error("client envelope profile_id mismatch");
+-  }
+-}
+-
+-async function listByProfile(saveStore, profileId) {
+-  if (typeof saveStore.listByProfile === "function") {
+-    return saveStore.listByProfile(profileId);
++    throw new SaveValidationError("client envelope profile_id mismatch");
+   }
+-  return [];
+ }
+ 
+-async function deleteByGameAndProfile(saveStore, gameId, profileId) {
+-  if (typeof saveStore.deleteByGameAndProfile === "function") {
+-    await saveStore.deleteByGameAndProfile(gameId, profileId);
++async function readServerEnvelope(store, gameId, profileId) {
++  const envelope = await store.get(gameId, profileId);
++  if (envelope) {
++    validateSaveEnvelope(envelope);
++    assertEnvelopeIdentity(envelope, gameId, profileId);
+   }
++  return envelope;
+ }
+diff --git a/services/save-service/src/saveStore.js b/services/save-service/src/saveStore.js
+index f3880ca..f834ea6 100644
+--- a/services/save-service/src/saveStore.js
++++ b/services/save-service/src/saveStore.js
+@@ -1,5 +1,8 @@
++import { isDeepStrictEqual } from "node:util";
+ import fs from "node:fs/promises";
+ import path from "node:path";
++import { validateCompareAndSwap, migrateSaveEnvelope } from "./saveConcurrency.js";
++import { validateSaveEnvelope } from "./saveEnvelope.js";
+ 
+ export class InMemorySaveStore {
+   constructor() {
+@@ -13,12 +16,36 @@ export class InMemorySaveStore {
+   }
+ 
+   async put(envelope) {
++    validateSaveEnvelope(envelope);
+     const key = createKey(envelope.game_id, envelope.profile_id);
+     const copy = deepClone(envelope);
+     this._records.set(key, copy);
+     return deepClone(copy);
+   }
+ 
++  async compareAndSwap(envelope, expectedRevision, expectedEnvelope) {
++    validateCompareAndSwap(envelope, expectedRevision);
++    const key = createKey(envelope.game_id, envelope.profile_id);
++    const current = this._records.get(key);
++    if ((current?.revision ?? null) !== expectedRevision) return { applied: false };
++    if (expectedEnvelope !== undefined && !isDeepStrictEqual(current ?? null, expectedEnvelope)) return { applied: false };
++    const copy = deepClone(envelope);
++    const result = { applied: true, envelope: deepClone(copy) };
++    this._records.set(key, copy);
++    return result;
++  }
++
++  async migrateProfileGame(gameId, primaryId, secondaryId, nowSeconds) {
++    if (primaryId === secondaryId) return { migrated: false };
++    const primaryKey = createKey(gameId, primaryId), secondaryKey = createKey(gameId, secondaryId);
++    const merged = migrateSaveEnvelope(this._records.get(primaryKey), this._records.get(secondaryKey), gameId, primaryId, secondaryId, nowSeconds);
++    if (!merged) return { migrated: false };
++    const copy = deepClone(merged);
++    this._records.set(primaryKey, copy);
++    this._records.delete(secondaryKey);
++    return { migrated: true };
++  }
++
+   async listByProfile(profileId) {
+     const profile = String(profileId || "").trim();
+     const out = [];
+@@ -35,96 +62,63 @@ export class InMemorySaveStore {
+   }
+ }
+ 
+-export class JsonFileSaveStore {
++export class JsonFileSaveStore extends InMemorySaveStore {
+   constructor(options = {}) {
++    super();
+     const filePath = String(options.filePath || "").trim();
+-    if (!filePath) {
+-      throw new Error("JsonFileSaveStore filePath is required");
+-    }
++    if (!filePath) throw new Error("JsonFileSaveStore filePath is required");
+     this._filePath = filePath;
+-    this._records = new Map();
+-    this._loaded = false;
+     this._writeQueue = Promise.resolve();
+   }
+-
+-  async get(gameId, profileId) {
+-    await this._ensureLoaded();
+-    const key = createKey(gameId, profileId);
+-    const envelope = this._records.get(key);
+-    return envelope ? deepClone(envelope) : null;
++  async get(gameId, profileId) { await this._ensureLoaded(); return super.get(gameId, profileId); }
++  async listByProfile(profileId) { await this._ensureLoaded(); return super.listByProfile(profileId); }
++  async put(envelope) { return this._mutate((stage) => stage.put(envelope)); }
++  async deleteByGameAndProfile(gameId, profileId) { return this._mutate((stage) => stage.deleteByGameAndProfile(gameId, profileId)); }
++  async compareAndSwap(envelope, expectedRevision, expectedEnvelope) {
++    return this._mutate((stage) => stage.compareAndSwap(envelope, expectedRevision, expectedEnvelope), (result) => result.applied);
+   }
+-
+-  async put(envelope) {
+-    await this._ensureLoaded();
+-    const key = createKey(envelope.game_id, envelope.profile_id);
+-    const copy = deepClone(envelope);
+-    this._records.set(key, copy);
+-    await this._enqueueWrite();
+-    return deepClone(copy);
++  async migrateProfileGame(gameId, primaryId, secondaryId, nowSeconds) {
++    return this._mutate((stage) => stage.migrateProfileGame(gameId, primaryId, secondaryId, nowSeconds), (result) => result.migrated);
+   }
+-
+-  async listByProfile(profileId) {
+-    await this._ensureLoaded();
+-    const profile = String(profileId || "").trim();
+-    const out = [];
+-    for (const row of this._records.values()) {
+-      if (String(row.profile_id || "") === profile) {
+-        out.push(deepClone(row));
++  async _mutate(mutation, shouldWrite = () => true) {
++    const operation = this._writeQueue.then(async () => {
++      await this._ensureLoaded();
++      const stage = new InMemorySaveStore();
++      stage._records = new Map(this._records);
++      const result = await mutation(stage);
++      if (shouldWrite(result)) {
++        await this._writeSnapshot(stage._records);
++        this._records = stage._records;
+       }
+-    }
+-    return out;
+-  }
+-
+-  async deleteByGameAndProfile(gameId, profileId) {
+-    await this._ensureLoaded();
+-    this._records.delete(createKey(gameId, profileId));
+-    await this._enqueueWrite();
++      return result;
++    });
++    this._writeQueue = operation.catch(() => {});
++    return operation;
+   }
+-
+   async _ensureLoaded() {
+-    if (this._loaded) {
+-      return;
+-    }
+-    this._loaded = true;
+-    const parent = path.dirname(this._filePath);
+-    await fs.mkdir(parent, { recursive: true });
+-    try {
+-      const raw = await fs.readFile(this._filePath, "utf8");
+-      if (!raw.trim()) {
+-        return;
+-      }
+-      const parsed = JSON.parse(raw);
+-      if (!Array.isArray(parsed)) {
+-        return;
+-      }
+-      for (const row of parsed) {
+-        if (!row || typeof row !== "object") {
+-          continue;
+-        }
+-        const gameId = String(row.game_id || "");
+-        const profileId = String(row.profile_id || "");
+-        if (!gameId || !profileId) {
+-          continue;
+-        }
+-        this._records.set(createKey(gameId, profileId), row);
+-      }
+-    } catch (error) {
+-      if (error && error.code === "ENOENT") {
+-        return;
+-      }
+-      throw error;
++    if (!this._loadPromise) {
++      this._loadPromise = (async () => {
++        await fs.mkdir(path.dirname(this._filePath), { recursive: true });
++        try {
++          const raw = await fs.readFile(this._filePath, "utf8");
++          if (!raw.trim()) return;
++          const rows = JSON.parse(raw);
++          if (!Array.isArray(rows)) throw new Error("invalid save store file");
++          const records = new Map();
++          for (const row of rows) {
++            validateSaveEnvelope(row);
++            records.set(createKey(row.game_id, row.profile_id), row);
++          }
++          this._records = records;
++        } catch (error) { if (error?.code !== "ENOENT") throw error; }
++      })().catch((error) => { this._loadPromise = null; throw error; });
+     }
++    await this._loadPromise;
+   }
+-
+-  async _enqueueWrite() {
+-    this._writeQueue = this._writeQueue.then(async () => {
+-      const values = Array.from(this._records.values());
+-      const serialized = JSON.stringify(values);
+-      const tempPath = `${this._filePath}.tmp`;
+-      await fs.writeFile(tempPath, serialized, "utf8");
+-      await fs.rename(tempPath, this._filePath);
+-    });
+-    await this._writeQueue;
++  async _writeSnapshot(records) {
++    const tempPath = `${this._filePath}.tmp`;
++    await fs.writeFile(tempPath, JSON.stringify(Array.from(records.values())), "utf8");
++    await fs.rename(tempPath, this._filePath);
+   }
+ }
+ 
+diff --git a/test/postgres-save-concurrency.test.js b/test/postgres-save-concurrency.test.js
+new file mode 100644
+index 0000000..ed06dea
+--- /dev/null
++++ b/test/postgres-save-concurrency.test.js
+@@ -0,0 +1,57 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { PostgresSaveStore, createSaveService, createDefaultSaveEnvelope, SaveConflictError } from "../services/save-service/index.js";
++const env = (profileId, payload = {}, revision = 1) => createDefaultSaveEnvelope({ gameId: "game", profileId, revision, updatedAt: 1_800_000_000, payload });
++it("Postgres CAS protects absent rows and conditional revisions (mock SQL)", async () => {
++  let query;
++  const store = new PostgresSaveStore({ pool: { async query(sql, params) { query = { sql, params }; return { rows: [] }; } } });
++  assert.equal((await store.compareAndSwap(env("primary"), null)).applied, false);
++  assert.match(query.sql, /ON CONFLICT.*DO NOTHING RETURNING envelope/);
++  assert.doesNotMatch(query.sql, /DO UPDATE/);
++  assert.equal((await store.compareAndSwap(env("primary", {}, 3), 2)).applied, false);
++  assert.match(query.sql, /WHERE.*game_id.*profile_id.*envelope->>'revision'.*\$4/s);
++  assert.equal(query.params[3], 2);
++  const snapshot = env("primary", { concurrent: true }, 2);
++  await store.compareAndSwap(env("primary", {}, 3), 2, snapshot);
++  assert.match(query.sql, /AND envelope = \$5::jsonb/);
++  assert.deepEqual(JSON.parse(query.params[4]), snapshot);
++});
++function scripted(steps) {
++  const released = [];
++  return { released, store: new PostgresSaveStore({ pool: {
++    async query() { throw new Error("migration escaped pinned client"); },
++    async connect() { return {
++      async query(sql, params) {
++        const step = steps.shift(); assert.ok(step, sql); assert.match(sql.replace(/\s+/g, " ").trim(), step.sql);
++        step.check?.(params); if (step.error) throw step.error; return { rows: step.rows || [] };
++      }, release(error) { released.push(error); }
++    }; }
++  } }) };
++}
++const begin = { sql: /^BEGIN$/ }, commit = { sql: /^COMMIT$/ }, rollback = { sql: /^ROLLBACK$/ };
++const select = { sql: /^SELECT envelope.*ORDER BY profile_id FOR UPDATE/ };
++const insert = { sql: /^INSERT.*DO NOTHING RETURNING envelope/, rows: [{ envelope: env("primary") }] };
++const update = { sql: /^UPDATE/ }, remove = { sql: /^DELETE/ };
++it("Postgres migration rolls back destination-insert races without deleting source", async () => {
++  const steps = [begin, { ...select, rows: [{ envelope: env("secondary") }] }, { ...insert, rows: [] }, rollback];
++  const { store, released } = scripted(steps);
++  await assert.rejects(store.migrateProfileGame("game", "primary", "secondary", 1_800_000_001), SaveConflictError);
++  assert.equal(steps.length, 0); assert.deepEqual(released, [undefined]);
++});
++it("Postgres migration retries/remerges a raced destination on a fresh transaction", async () => {
++  const steps = [begin, { ...select, rows: [{ envelope: env("secondary", { games_played: 8 }) }] }, { ...insert, rows: [] }, rollback,
++    begin, { ...select, rows: [{ envelope: env("secondary", { games_played: 8 }) }, { envelope: env("primary", { high_score: 90 }) }] },
++    { ...update, check(params) { const result = JSON.parse(params[2]); assert.equal(result.payload.high_score, 90); assert.equal(result.payload.games_played, 8); } }, remove, commit];
++  const { store, released } = scripted(steps);
++  // The service lists games once, but the adapter re-reads both rows per attempt.
++  store.listByProfile = async () => [env("secondary")];
++  assert.deepEqual(await createSaveService({ saveStore: store }).mergeProfiles({ primaryProfileId: "primary", secondaryProfileId: "secondary", nowSeconds: 1_800_000_001 }), { merged: true, affected_games: ["game"] });
++  assert.equal(steps.length, 0); assert.deepEqual(released, [undefined, undefined]);
++});
++it("Postgres source-delete failure rolls back the destination write and releases", async () => {
++  const error = new Error("delete failed");
++  const steps = [begin, { ...select, rows: [{ envelope: env("secondary") }] }, insert, { ...remove, error }, rollback];
++  const { store, released } = scripted(steps);
++  await assert.rejects(store.migrateProfileGame("game", "primary", "secondary", 1_800_000_001), (actual) => actual === error);
++  assert.equal(steps.length, 0); assert.deepEqual(released, [undefined]);
++});
+diff --git a/test/postgres-save-integration.test.js b/test/postgres-save-integration.test.js
+new file mode 100644
+index 0000000..dfccafa
+--- /dev/null
++++ b/test/postgres-save-integration.test.js
+@@ -0,0 +1,63 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { PostgresSaveStore, createSaveService, createDefaultSaveEnvelope } from "../services/save-service/index.js";
++
++it("real local PostgreSQL: concurrent save retries and atomic migration rollback", {
++  skip: !process.env.SAVE_TEST_LOCAL_DATABASE_URL, timeout: 30_000
++}, async () => {
++  // Explicit opt-in only; never fall back to production DATABASE_URL.
++  const url = new URL(process.env.SAVE_TEST_LOCAL_DATABASE_URL);
++  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
++  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
++  assert.equal(url.search, "", "connection-string overrides are forbidden");
++  const { default: pg } = await import("pg");
++  const schema = `save_test_${process.pid}_${Date.now()}`;
++  const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
++  let pool, created = false;
++  try {
++    await admin.query(`CREATE SCHEMA ${schema}`); created = true;
++    pool = new pg.Pool({ connectionString: url.toString(), options: `-c search_path=${schema}`, max: 8, connectionTimeoutMillis: 3000 });
++    const a = new PostgresSaveStore({ pool }), b = new PostgresSaveStore({ pool });
++    await a.init();
++    const envelope = (profile, payload) => ({ ...createDefaultSaveEnvelope({ gameId: "game", profileId: profile, updatedAt: 100 }), payload });
++    // Force both services to read the same snapshot; exercise initial INSERT
++    // conflict and existing-row UPDATE conflict with the real engine.
++    for (const seeded of [false, true]) {
++      const profile = seeded ? "existing" : "initial";
++      if (seeded) await a.put(envelope(profile, {}));
++      let arrivals = 0, release;
++      const gate = new Promise((resolve) => { release = resolve; });
++      const wrap = (store) => ({
++        async get(...args) {
++          const row = await store.get(...args);
++          if (++arrivals <= 2) { if (arrivals === 2) release(); await gate; }
++          return row;
++        }, compareAndSwap: store.compareAndSwap.bind(store)
++      });
++      await Promise.all([
++        createSaveService({ saveStore: wrap(a) }).syncSave({ gameId: "game", profileId: profile, clientEnvelope: envelope(profile, { high_score: 300, left: true }) }),
++        createSaveService({ saveStore: wrap(b) }).syncSave({ gameId: "game", profileId: profile, clientEnvelope: envelope(profile, { games_played: 8, right: true }) })
++      ]);
++      const saved = await a.get("game", profile);
++      assert.equal(saved.payload.high_score, 300); assert.equal(saved.payload.games_played, 8);
++      assert.equal(saved.payload.left, true); assert.equal(saved.payload.right, true);
++      assert.equal(saved.revision, seeded ? 3 : 2);
++    }
++    await a.put(envelope("primary", { high_score: 400 }));
++    await a.put(envelope("secondary", { games_played: 9 }));
++    await pool.query(`CREATE FUNCTION reject_save_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected save delete failure'; END $$`);
++    await pool.query("CREATE TRIGGER reject_save_delete BEFORE DELETE ON save_envelopes FOR EACH ROW EXECUTE FUNCTION reject_save_delete()");
++    await assert.rejects(a.migrateProfileGame("game", "primary", "secondary", 200), /injected save delete failure/);
++    assert.equal((await a.get("game", "primary")).revision, 1);
++    assert.equal((await a.get("game", "secondary")).payload.games_played, 9);
++    await pool.query("DROP TRIGGER reject_save_delete ON save_envelopes");
++    await a.migrateProfileGame("game", "primary", "secondary", 200);
++    assert.equal((await a.get("game", "primary")).payload.games_played, 9);
++    assert.equal((await a.get("game", "primary")).payload.high_score, 400);
++    assert.equal(await a.get("game", "secondary"), null);
++  } finally {
++    if (pool) await pool.end();
++    try { if (created) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
++    finally { await admin.end(); }
++  }
++});
+diff --git a/test/save-concurrency-http.test.js b/test/save-concurrency-http.test.js
+new file mode 100644
+index 0000000..9aeb99b
+--- /dev/null
++++ b/test/save-concurrency-http.test.js
+@@ -0,0 +1,37 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { createSaveService, createSaveHttpServer, InMemorySaveStore, createDefaultSaveEnvelope } from "../services/save-service/index.js";
++import { createSessionToken } from "../packages/shared-utils/index.js";
++
++it("save HTTP exposes bounded conflicts, malformed input and storage failures distinctly", async () => {
++  const store = new InMemorySaveStore();
++  const envelope = createDefaultSaveEnvelope({ gameId: "game", profileId: "profile", updatedAt: 100 });
++  await store.put(envelope);
++  const original = store.compareAndSwap.bind(store);
++  store.compareAndSwap = async () => ({ applied: false });
++  const service = createSaveService({ saveStore: store, maxWriteAttempts: 2 });
++  const secret = "local-save-route-test-secret";
++  const token = createSessionToken({ sub: "profile" }, secret, { ttlSeconds: 600 });
++  const server = createSaveHttpServer({ service, sessionSecret: secret });
++  const { baseUrl } = await server.listen();
++  const send = (clientEnvelope) => fetch(`${baseUrl}/v1/save/sync`, {
++    method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
++    body: JSON.stringify({ game_id: "game", client_envelope: clientEnvelope })
++  });
++  try {
++    let response = await send(envelope), body = await response.json();
++    assert.equal(response.status, 409); assert.equal(body.error.code, "save_conflict");
++    assert.equal(body.retryable, true); assert.deepEqual(body.envelope, envelope);
++    for (const malformed of ["bad", [], { ...envelope, revision: "1" }]) {
++      response = await send(malformed); body = await response.json();
++      assert.equal(response.status, 422); assert.equal(body.error.code, "invalid_request");
++    }
++    store.compareAndSwap = async () => { throw new Error("private storage detail"); };
++    response = await send(envelope); body = await response.json();
++    assert.equal(response.status, 500); assert.equal(body.error.code, "internal_error");
++    assert.ok(!JSON.stringify(body).includes("private storage detail"));
++    store.compareAndSwap = original;
++    response = await send(envelope); body = await response.json();
++    assert.equal(response.status, 200); assert.equal(body.source, "merged"); assert.equal(body.envelope.revision, 2);
++  } finally { await server.close(); }
++});
+diff --git a/test/save-concurrency.test.js b/test/save-concurrency.test.js
+new file mode 100644
+index 0000000..0472e2c
+--- /dev/null
++++ b/test/save-concurrency.test.js
+@@ -0,0 +1,145 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { createSaveService, createDefaultSaveEnvelope, InMemorySaveStore, JsonFileSaveStore, SaveConflictError } from "../services/save-service/index.js";
++const now = 1_800_000_000;
++const envelope = (payload = {}, profileId = "player", revision = 1) => createDefaultSaveEnvelope({ gameId: "game", profileId, revision, updatedAt: now, payload });
++const sync = (service, clientEnvelope) => service.syncSave({ gameId: "game", profileId: "player", clientEnvelope, nowSeconds: now + 10 });
++function raceFirstReads(store) {
++  const get = store.get.bind(store);
++  let reads = 0, release;
++  const gate = new Promise((resolve) => { release = resolve; });
++  store.get = async (...args) => {
++    const snapshot = await get(...args);
++    if (reads++ < 2) { if (reads === 2) release(); await gate; }
++    return snapshot;
++  };
++}
++for (const kind of ["memory", "file"]) {
++  describe(`${kind} revision-safe sync`, () => {
++    async function withStore(run) {
++      const dir = kind === "file" ? await fs.mkdtemp(path.join(os.tmpdir(), "save-cas-")) : null;
++      const filePath = dir ? path.join(dir, "saves.json") : null;
++      const store = dir ? new JsonFileSaveStore({ filePath }) : new InMemorySaveStore();
++      try { await run(store, createSaveService({ saveStore: store }), filePath); }
++      finally { if (dir) await fs.rm(dir, { recursive: true, force: true }); }
++    }
++    for (const initial of [false, true]) {
++      it(`preserves both devices' progress with ${initial ? "existing" : "missing"} row and stale-read retry`, () => withStore(async (store, service, filePath) => {
++        if (initial) await store.put(envelope({ server_flag: true }));
++        raceFirstReads(store);
++        let attempts = 0;
++        const cas = store.compareAndSwap.bind(store);
++        store.compareAndSwap = (...args) => { attempts++; return cas(...args); };
++        await Promise.all([sync(service, envelope({ high_score: 300, device_a: true })), sync(service, envelope({ games_played: 8, device_b: true }))]);
++        const result = await store.get("game", "player");
++        assert.equal(result.payload.high_score, 300);
++        assert.equal(result.payload.games_played, 8);
++        assert.equal(result.payload.device_a, true);
++        assert.equal(result.payload.device_b, true);
++        if (initial) assert.equal(result.payload.server_flag, true);
++        assert.ok(attempts >= 3);
++        assert.equal(result.revision, initial ? 3 : 2);
++        if (filePath) assert.deepEqual(await new JsonFileSaveStore({ filePath }).get("game", "player"), result);
++      }));
++    }
++    it("rejects a stale snapshot after deletion and recreation with the same revision", () => withStore(async (store, service) => {
++      await store.put(envelope({ old: true }));
++      const cas = store.compareAndSwap.bind(store);
++      let intercepted = false;
++      store.compareAndSwap = async (...args) => {
++        if (!intercepted) {
++          intercepted = true;
++          await store.deleteByGameAndProfile("game", "player");
++          await store.put(envelope({ recreated: true, high_score: 900 }));
++        }
++        return cas(...args);
++      };
++      await sync(service, envelope({ games_played: 5 }));
++      const saved = await store.get("game", "player");
++      assert.equal(saved.payload.recreated, true);
++      assert.equal(saved.payload.high_score, 900);
++      assert.equal(saved.payload.games_played, 5);
++    }));
++    it("racing default creation cannot overwrite a client first write", () => withStore(async (store, service) => {
++      raceFirstReads(store);
++      await Promise.all([sync(service), sync(service, envelope({ high_score: 55 }))]);
++      assert.equal((await store.get("game", "player")).payload.high_score, 55);
++    }));
++    it("bounds contention retries and returns the latest committed envelope", () => withStore(async (store) => {
++      await store.put(envelope({ high_score: 75 }));
++      let attempts = 0;
++      store.compareAndSwap = async () => { attempts++; return { applied: false }; };
++      const service = createSaveService({ saveStore: store, maxWriteAttempts: 3 });
++      await assert.rejects(sync(service, envelope({ games_played: 4 })), (error) => error instanceof SaveConflictError && error.envelope.payload.high_score === 75 && error.retryable);
++      assert.equal(attempts, 3);
++      assert.equal((await store.get("game", "player")).payload.games_played, 0);
++    }));
++    it("does not consume a revision on write failure and a later retry succeeds", () => withStore(async (store, service) => {
++      const cas = store.compareAndSwap.bind(store);
++      store.compareAndSwap = async () => { throw new Error("storage failure"); };
++      await assert.rejects(sync(service, envelope({ high_score: 25 })), /storage failure/);
++      assert.equal(await store.get("game", "player"), null);
++      store.compareAndSwap = cas;
++      assert.equal((await sync(service, envelope({ high_score: 25 }))).envelope.revision, 1);
++    }));
++    it("migrates a game's source/destination atomically with concurrent primary sync", () => withStore(async (store, service) => {
++      await store.put(envelope({ games_played: 9, secondary_flag: true }, "secondary"));
++      await store.put(envelope({ high_score: 50 }));
++      await Promise.all([service.mergeProfiles({ primaryProfileId: "player", secondaryProfileId: "secondary", nowSeconds: now + 10 }), sync(service, envelope({ high_score: 500, primary_flag: true }))]);
++      const result = await store.get("game", "player");
++      assert.equal(result.payload.high_score, 500);
++      assert.equal(result.payload.games_played, 9);
++      assert.equal(result.payload.secondary_flag, true);
++      assert.equal(result.payload.primary_flag, true);
++      assert.equal(await store.get("game", "secondary"), null);
++      assert.deepEqual((await service.mergeProfiles({ primaryProfileId: "player", secondaryProfileId: "secondary" })).affected_games, []);
++    }));
++  });
++}
++
++describe("save validation and persistence boundaries", () => {
++  it("rejects malformed revisions/schema versions before writing", async () => {
++    const store = new InMemorySaveStore();
++    const service = createSaveService({ saveStore: store });
++    for (const field of ["revision", "schema_version"]) {
++      for (const value of ["1", 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null]) {
++        await assert.rejects(sync(service, { ...envelope(), [field]: value }), /positive safe integer/);
++      }
++    }
++    assert.equal(await store.get("game", "player"), null);
++    await assert.rejects(sync(service, { ...envelope(), payload: [] }), /payload must be an object/);
++    await assert.rejects(store.compareAndSwap(envelope(), undefined), /expected revision/);
++    await assert.rejects(store.compareAndSwap(envelope(), 1), /must advance/);
++  });
++  it("file persistence failure keeps both migration rows and retries recover", async () => {
++    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "save-migrate-fault-"));
++    const filePath = path.join(dir, "saves.json");
++    const store = new JsonFileSaveStore({ filePath });
++    const service = createSaveService({ saveStore: store });
++    try {
++      await store.put(envelope({ high_score: 15 }));
++      await store.put(envelope({ games_played: 8 }, "secondary"));
++      const before = await fs.readFile(filePath, "utf8");
++      const persist = store._writeSnapshot.bind(store);
++      store._writeSnapshot = async () => { throw new Error("snapshot failed"); };
++      await assert.rejects(service.mergeProfiles({ primaryProfileId: "player", secondaryProfileId: "secondary" }), /snapshot failed/);
++      assert.equal(await fs.readFile(filePath, "utf8"), before);
++      assert.equal((await store.get("game", "secondary")).payload.games_played, 8);
++      assert.equal((await store.get("game", "player")).payload.games_played, 0);
++      await assert.rejects(sync(service, envelope({ high_score: 99 })), /snapshot failed/);
++      store._writeSnapshot = persist;
++      await service.mergeProfiles({ primaryProfileId: "player", secondaryProfileId: "secondary" });
++      await sync(service, envelope({ high_score: 99 }));
++      const loaded = new JsonFileSaveStore({ filePath });
++      assert.equal((await loaded.get("game", "player")).payload.high_score, 99);
++      assert.equal((await loaded.get("game", "player")).payload.games_played, 8);
++      assert.equal(await loaded.get("game", "secondary"), null);
++    } finally { await fs.rm(dir, { recursive: true, force: true }); }
++  });
++  it("fails closed for old adapters without conditional writes", () => {
++    assert.throws(() => createSaveService({ saveStore: { get() {}, put() {} } }), /compareAndSwap is required/);
++  });
++});
+-- 
+2.39.3 (Apple Git-145)
+

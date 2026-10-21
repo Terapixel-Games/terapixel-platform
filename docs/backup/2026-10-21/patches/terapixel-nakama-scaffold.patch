@@ -1,0 +1,175 @@
+From c42eee71eeb159a945e1f81dc620fc7acd744c4e Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:27:35 -0500
+Subject: [PATCH] Harden compatibility Nakama scaffold identity exchange
+
+---
+ templates/nakama-game-backend/README.md       | 21 +++++++
+ .../nakama/modules/index.js                   | 61 +++++++++----------
+ test/nakama-scaffold.test.js                  | 40 ++++++++++++
+ 3 files changed, 90 insertions(+), 32 deletions(-)
+ create mode 100644 test/nakama-scaffold.test.js
+
+diff --git a/templates/nakama-game-backend/README.md b/templates/nakama-game-backend/README.md
+index f2dcf8a..cec2068 100644
+--- a/templates/nakama-game-backend/README.md
++++ b/templates/nakama-game-backend/README.md
+@@ -11,3 +11,24 @@ Includes:
+ - Client authenticates with Nakama custom auth (guest/email/provider).
+ - Nakama module calls `terapixel-platform` `POST /v1/auth/nakama`.
+ - Module returns platform `session_token` + `global_player_id` to client as RPC payload.
++
++## Identity exchange compatibility and rollout
++
++Prefer the canonical `Terapixel-Games/ArcadeCore` backend template for new games.
++This compatibility scaffold now registers Nakama's `(ctx, logger, nk, payload)`
++RPC callback directly and requires authenticated `ctx.userId`. Client-selected
++user IDs/game IDs/keys are ignored. `GAME_ID`, `PLATFORM_IDENTITY_URL` and dedicated
++`TPX_NAKAMA_EXCHANGE_KEY` are read from server runtime configuration at InitModule.
++The key must match the gateway mapping for this game/environment and contain at
++least 32 URL-safe characters. No key is provided. Never reuse an admin/API key.
++Only the identity exchange gets `x-nakama-exchange-key`; failure logs omit response
++bodies. Missing configuration fails before HTTP.
++
++An operator must inject the approved key into Nakama `runtime.env`; merely adding
++it to the container environment does not configure the JavaScript runtime. This
++minimal Docker/Render scaffold does not supply that wiring and is not deployment
++ready by itself. No credentials, hosting settings or live bindings are created.
++Coordinate gateway PR7 and all backend callers from reviewed main revisions,
++then staging, then production. Do not grant a credential to any remaining caller
++that forwards payload-selected identities. The canonical rollout inventory is in
++ArcadeCore `docs/IDENTITY_EXCHANGE_ROLLOUT.md`.
+diff --git a/templates/nakama-game-backend/nakama/modules/index.js b/templates/nakama-game-backend/nakama/modules/index.js
+index 66caf5d..6406114 100644
+--- a/templates/nakama-game-backend/nakama/modules/index.js
++++ b/templates/nakama-game-backend/nakama/modules/index.js
+@@ -1,51 +1,48 @@
++// Compatibility scaffold. Canonical maintained source lives in ArcadeCore.
++var EXCHANGE_CONFIG = { platformUrl: "", gameId: "", key: "" };
++
+ function InitModule(ctx, logger, nk, initializer) {
+-  initializer.registerRpc("platform_auth_exchange", function (rpcCtx, payload) {
+-    return rpcPlatformAuthExchange(rpcCtx, payload, logger, nk);
+-  });
++  var env = (ctx && ctx.env) || {};
++  EXCHANGE_CONFIG = {
++    platformUrl: String(env.PLATFORM_IDENTITY_URL || "").trim(),
++    gameId: String(env.GAME_ID || "").trim().toLowerCase(),
++    key: String(env.TPX_NAKAMA_EXCHANGE_KEY || "")
++  };
++  initializer.registerRpc("platform_auth_exchange", rpcPlatformAuthExchange);
+   logger.info("Nakama module template loaded with platform_auth_exchange RPC.");
+ }
+ 
+-function rpcPlatformAuthExchange(ctx, payload, logger, nk) {
+-  const parsed = parsePayload(payload);
+-  const platformUrl = String(ctx.env.PLATFORM_IDENTITY_URL || "").trim();
+-  const gameId = String(ctx.env.GAME_ID || "").trim();
+-  if (!platformUrl) {
+-    throw new Error("PLATFORM_IDENTITY_URL is required");
++function rpcPlatformAuthExchange(ctx, logger, nk, payload) {
++  if (!ctx || typeof ctx.userId !== "string" || !ctx.userId.trim()) {
++    throw new Error("authenticated Nakama user is required");
+   }
+-  if (!gameId) {
+-    throw new Error("GAME_ID is required");
++  if (!EXCHANGE_CONFIG.platformUrl || !EXCHANGE_CONFIG.gameId) {
++    throw new Error("PLATFORM_IDENTITY_URL and GAME_ID are required");
+   }
+-  if (!parsed.nakama_user_id) {
+-    throw new Error("nakama_user_id is required");
++  if (EXCHANGE_CONFIG.key.length < 32 || !/^[A-Za-z0-9_-]+$/.test(EXCHANGE_CONFIG.key)) {
++    throw new Error("TPX_NAKAMA_EXCHANGE_KEY is not configured correctly");
+   }
+-
++  const parsed = parsePayload(payload);
+   const response = nk.httpRequest(
+-    `${platformUrl}/v1/auth/nakama`,
++    `${EXCHANGE_CONFIG.platformUrl}/v1/auth/nakama`,
+     "post",
+-    {
+-      "content-type": "application/json"
+-    },
+-    JSON.stringify({
+-      game_id: gameId,
+-      nakama_user_id: parsed.nakama_user_id,
+-      display_name: parsed.display_name || ""
+-    }),
+-    5000
++    { "content-type": "application/json", "x-nakama-exchange-key": EXCHANGE_CONFIG.key },
++    JSON.stringify({ game_id: EXCHANGE_CONFIG.gameId, nakama_user_id: ctx.userId, display_name: parsed.display_name || ctx.username || "" }),
++    5000,
++    false
+   );
+-
+   if (response.code < 200 || response.code >= 300) {
+-    logger.error(
+-      `platform_auth_exchange failed code=${response.code} body=${response.body}`
+-    );
++    logger.error(`platform_auth_exchange failed code=${response.code}`);
+     throw new Error("platform auth exchange failed");
+   }
+-
+   return response.body;
+ }
+ 
+ function parsePayload(payload) {
+-  if (!payload) {
+-    return {};
++  if (!payload) return {};
++  const parsed = JSON.parse(payload);
++  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
++    throw new Error("payload must be an object");
+   }
+-  return JSON.parse(payload);
++  return parsed;
+ }
+diff --git a/test/nakama-scaffold.test.js b/test/nakama-scaffold.test.js
+new file mode 100644
+index 0000000..dfd474d
+--- /dev/null
++++ b/test/nakama-scaffold.test.js
+@@ -0,0 +1,40 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import vm from "node:vm";
++const source = fs.readFileSync(new URL("../templates/nakama-game-backend/nakama/modules/index.js", import.meta.url), "utf8");
++const key = "test-only-scaffold-server-key-at-least-32-bytes";
++function scaffold(env = {}) {
++  const context = vm.createContext({}); vm.runInContext(source, context);
++  let rpc;
++  const calls = [], logs = [];
++  const logger = { info() {}, error(message) { logs.push(message); } };
++  const nk = { httpRequest(url, method, headers, body) { calls.push({ url, headers, body: JSON.parse(body) }); return { code: 200, body: '{"session_token":"test-session"}' }; } };
++  context.InitModule({ env: { GAME_ID: "fixture", PLATFORM_IDENTITY_URL: "https://identity.test", TPX_NAKAMA_EXCHANGE_KEY: key, ...env } }, logger, nk, { registerRpc(name, handler) { assert.equal(name, "platform_auth_exchange"); rpc = handler; } });
++  return { rpc, nk, logger, calls, logs };
++}
++it("compatibility scaffold uses the actual Nakama callback and server-owned identity contract", () => {
++  const { rpc, nk, logger, calls } = scaffold();
++  const response = rpc({ userId: "caller", env: { GAME_ID: "other", TPX_NAKAMA_EXCHANGE_KEY: "attacker" } }, logger, nk, '{"nakama_user_id":"victim","game_id":"other"}');
++  assert.equal(JSON.parse(response).session_token, "test-session");
++  assert.equal(calls[0].body.nakama_user_id, "caller");
++  assert.equal(calls[0].body.game_id, "fixture");
++  assert.equal(calls[0].headers["x-nakama-exchange-key"], key);
++});
++it("compatibility scaffold fails before HTTP for missing authentication/configuration", () => {
++  const { rpc, logger, nk, calls } = scaffold();
++  for (const ctx of [undefined, {}, { userId: " " }, { userId: 42 }]) assert.throws(() => rpc(ctx, logger, nk, "{}"), /authenticated Nakama/);
++  assert.equal(calls.length, 0);
++  for (const env of [{ TPX_NAKAMA_EXCHANGE_KEY: "" }, { GAME_ID: "" }, { TPX_NAKAMA_EXCHANGE_KEY: "bad\nkey" }]) {
++    const s = scaffold(env);
++    assert.throws(() => s.rpc({ userId: "caller" }, s.logger, s.nk, "{}"), /required|configured/);
++    assert.equal(s.calls.length, 0);
++  }
++});
++it("compatibility scaffold rejects malformed payloads and never logs response secrets", () => {
++  const s = scaffold();
++  for (const body of ["{", "null", "[]"]) assert.throws(() => s.rpc({ userId: "caller" }, s.logger, s.nk, body));
++  s.nk.httpRequest = () => ({ code: 401, body: "sensitive-response-must-not-be-logged" });
++  assert.throws(() => s.rpc({ userId: "caller" }, s.logger, s.nk, "{}"), /exchange failed/);
++  assert.equal(s.logs.join("").includes("sensitive-response"), false);
++});
+-- 
+2.39.3 (Apple Git-145)
+

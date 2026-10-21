@@ -1,0 +1,411 @@
+From 8022476d8c91a7d1ca1049bb56cac1a98d7fbfd2 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 13:47:45 -0500
+Subject: [PATCH] Authenticate Nakama identity exchange callers with
+ server-only game credential
+
+---
+ backend/nakama/README.md                      |  57 ++++++++
+ backend/nakama/modules/index.js               |  31 +++-
+ backend/nakama/modules/lumarush.js            |  30 +++-
+ backend/nakama/render/start.sh                |  11 ++
+ .../nakama/tests/identity_exchange.test.js    | 136 ++++++++++++++++++
+ 5 files changed, 252 insertions(+), 13 deletions(-)
+ create mode 100644 backend/nakama/tests/identity_exchange.test.js
+
+diff --git a/backend/nakama/README.md b/backend/nakama/README.md
+index c6db6f9..8e4d7a0 100644
+--- a/backend/nakama/README.md
++++ b/backend/nakama/README.md
+@@ -186,3 +186,60 @@ Active runtime endpoints:
+ 4. Apply with `gcloud run services replace`.
+ 
+ Use `backend/nakama/cloudrun/README.md` for exact commands.
++
++## Authenticated Nakama identity exchange
++
++The companion platform hardening requires a dedicated backend credential for
++`POST /v1/auth/nakama`. Set server-only `TPX_NAKAMA_EXCHANGE_KEY` to the approved
++credential matching this environment's `lumarush` entry in the gateway's
++`NAKAMA_EXCHANGE_KEYS_JSON`. Use at least 32 characters from `A-Z`, `a-z`, `0-9`,
++`_`, and `-`; no credential is supplied here. Do not reuse platform admin/API keys,
++Nakama server/HTTP keys, or another game's/environment's credential. Never put this
++value in Godot exports, client payloads, checked-in YAML, command tracing, or logs.
++Missing or invalid configuration disables exchange before any outbound request.
++
++Both `modules/lumarush.js` and the template-derived `modules/index.js` now require
++an authenticated nonblank string `ctx.userId`. The template RPC
++`platform_auth_exchange` ignores payload identity/game/credential fields and uses
++only `ctx.userId`, server `GAME_ID`, and the configured credential. The active
++LumaRush path uses server `TPX_GAME_ID` (default `lumarush`). Only identity exchange
++requests get `x-nakama-exchange-key`; other platform requests do not receive it.
++
++Loading analysis: `local.yml` and generated `render/start.sh` runtime config both
++select `js_entrypoint: "lumarush.js"`. `Dockerfile.render` copies the modules and
++uses that startup script; Cloud Run reuses it. `index.js` is a separate alternative
++entrypoint, not imported by `lumarush.js`. These files each define `InitModule`,
++`MODULE_CONFIG`, account RPCs and exchange helpers; do not concatenate them or
++load them into one JavaScript scope. Tests evaluate each module in a separate VM
++and exercise both registrations and exchange paths. Actual deployed runtime
++configuration has not been inspected; no Nakama container was started by these tests.
++
++Server configuration prerequisites (not applied): Render/Cloud Run must inject
++`TPX_NAKAMA_EXCHANGE_KEY` as a protected environment/secret value. `render/start.sh`
++now forwards it into Nakama `runtime.env`, rejects YAML-unsafe characters without
++printing the value, and writes generated runtime config with owner-only access.
++Cloud Run operators must add an approved secret-backed environment reference to
++the service configuration; no secret name/value or binding is created here.
++For local Docker Compose, use a private server runtime-config override containing
++this runtime env value; the supplied Compose path mounts `local.yml` directly and
++does not forward arbitrary host/container env into Nakama runtime automatically.
++Do not pass credentials through the existing traced (`-ecx`) Compose command.
++
++Release coordination:
++
++1. Audit/fix the canonical ArcadeCore template and other generated game callers;
++   this local companion covers LumaRush only. Do not grant exchange authority to
++   a backend that still forwards payload-selected identities.
++2. Review/test both platform and caller commits, then merge to their respective
++   `main` branches before any staging release. The platform main workflow may
++   automatically deploy staging when its environment gate is enabled.
++3. Separately approve provisioning/configuration of per-game/environment
++   credentials and coordinate releases from reviewed main revisions. Hardened
++   callers without credentials and a hardened gateway without matching mappings
++   deliberately fail closed; schedule this availability transition explicitly.
++4. Validate controlled staging account flows and negative identity/game cases,
++   including magic-link initiation and merge flows that depend on exchange;
++   promote reviewed main revisions to production only after validation.
++
++Run the backend tests with Node 20:
++`node --test backend/nakama/tests/*.test.js`.
+diff --git a/backend/nakama/modules/index.js b/backend/nakama/modules/index.js
+index 4b5209b..32725e9 100644
+--- a/backend/nakama/modules/index.js
++++ b/backend/nakama/modules/index.js
+@@ -18,6 +18,7 @@ var MODULE_CONFIG = {
+   gameId: "",
+   leaderboardId: "",
+   platformIdentityUrl: "",
++  nakamaExchangeKey: "",
+   platformUsernameValidateUrl: "",
+   platformAccountMagicLinkStartUrl: "",
+   platformAccountMagicLinkCompleteUrl: "",
+@@ -56,6 +57,7 @@ function loadConfig(ctx) {
+     gameId: gameId,
+     leaderboardId: String(env.LEADERBOARD_ID || (gameId + "_high_scores")).trim().toLowerCase(),
+     platformIdentityUrl: String(env.PLATFORM_IDENTITY_URL || "").trim(),
++    nakamaExchangeKey: String(env.TPX_NAKAMA_EXCHANGE_KEY || ""),
+     platformUsernameValidateUrl: String(env.PLATFORM_USERNAME_VALIDATE_URL || "").trim(),
+     platformAccountMagicLinkStartUrl: String(
+       env.PLATFORM_ACCOUNT_MAGIC_LINK_START_URL || env.TPX_PLATFORM_MAGIC_LINK_START_URL || ""
+@@ -86,8 +88,12 @@ function loadConfig(ctx) {
+ }
+ 
+ function rpcPlatformAuthExchange(ctx, logger, nk, payload) {
++  assertAuthenticated(ctx);
++  if (typeof ctx.userId !== "string" || !ctx.userId.trim()) {
++    throw new Error("User session is required.");
++  }
+   var data = parsePayload(payload);
+-  var nakamaUserId = String(data.nakama_user_id || ctx.userId || "").trim();
++  var nakamaUserId = String(ctx.userId).trim();
+   if (!nakamaUserId) {
+     throw new Error("nakama_user_id is required");
+   }
+@@ -97,9 +103,7 @@ function rpcPlatformAuthExchange(ctx, logger, nk, payload) {
+   var response = nk.httpRequest(
+     MODULE_CONFIG.platformIdentityUrl + "/v1/auth/nakama",
+     "post",
+-    {
+-      "Content-Type": "application/json",
+-    },
++    nakamaExchangeHeaders(),
+     JSON.stringify({
+       game_id: MODULE_CONFIG.gameId,
+       nakama_user_id: nakamaUserId,
+@@ -489,15 +493,17 @@ function rpcClientEventTrack(ctx, logger, nk, payload) {
+ }
+ 
+ function exchangePlatformSession(ctx, nk) {
++  assertAuthenticated(ctx);
++  if (typeof ctx.userId !== "string" || !ctx.userId.trim()) {
++    throw new Error("User session is required.");
++  }
+   if (!MODULE_CONFIG.platformIdentityUrl) {
+     throw new Error("PLATFORM_IDENTITY_URL is required");
+   }
+   var response = nk.httpRequest(
+     MODULE_CONFIG.platformIdentityUrl + "/v1/auth/nakama",
+     "post",
+-    {
+-      "Content-Type": "application/json"
+-    },
++    nakamaExchangeHeaders(),
+     JSON.stringify({
+       game_id: MODULE_CONFIG.gameId,
+       nakama_user_id: String((ctx && ctx.userId) || "").trim(),
+@@ -1299,3 +1305,14 @@ function trimReplayEntries(entries, maxEntries) {
+   }
+   return out;
+ }
++
++function nakamaExchangeHeaders() {
++  if (!String(MODULE_CONFIG.gameId || "").trim()) {
++    throw new Error("server game ID is required for identity exchange");
++  }
++  var key = MODULE_CONFIG.nakamaExchangeKey;
++  if (typeof key !== "string" || key.length < 32 || !/^[A-Za-z0-9_-]+$/.test(key)) {
++    throw new Error("TPX_NAKAMA_EXCHANGE_KEY is not configured correctly");
++  }
++  return { "Content-Type": "application/json", "x-nakama-exchange-key": key };
++}
+diff --git a/backend/nakama/modules/lumarush.js b/backend/nakama/modules/lumarush.js
+index d3d22f3..2ed866c 100644
+--- a/backend/nakama/modules/lumarush.js
++++ b/backend/nakama/modules/lumarush.js
+@@ -73,6 +73,7 @@ var MODULE_CONFIG = {
+   authUrl: "",
+   eventUrl: "",
+   identityNakamaAuthUrl: "",
++  nakamaExchangeKey: "",
+   iapVerifyUrl: "",
+   iapEntitlementsUrl: "",
+   iapCoinsAdjustUrl: "",
+@@ -157,6 +158,7 @@ function loadConfig(ctx) {
+     authUrl: env.TPX_PLATFORM_AUTH_URL || "",
+     eventUrl: env.TPX_PLATFORM_EVENT_URL || "",
+     identityNakamaAuthUrl: env.TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL || "",
++    nakamaExchangeKey: String(env.TPX_NAKAMA_EXCHANGE_KEY || ""),
+     iapVerifyUrl: env.TPX_PLATFORM_IAP_VERIFY_URL || "",
+     iapEntitlementsUrl: env.TPX_PLATFORM_IAP_ENTITLEMENTS_URL || "",
+     iapCoinsAdjustUrl: env.TPX_PLATFORM_IAP_COINS_ADJUST_URL || "",
+@@ -1349,22 +1351,27 @@ function persistIapSnapshot(nk, userId, entitlements) {
+ }
+ 
+ function exchangePlatformSession(ctx, nk) {
++  assertAuthenticated(ctx);
++  if (typeof ctx.userId !== "string" || !ctx.userId.trim()) {
++    throw new Error("User session is required.");
++  }
+   var authUrl =
+     MODULE_CONFIG.identityNakamaAuthUrl ||
+     ((ctx && ctx.env && ctx.env.TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL) || "");
+   if (!authUrl) {
+     throw new Error("identity exchange URL is not configured");
+   }
+-  var response = platformPost(
+-    nk,
++  var response = nk.httpRequest(
+     authUrl,
+-    {
++    "post",
++    nakamaExchangeHeaders(),
++    JSON.stringify({
+       game_id: MODULE_CONFIG.gameId,
+       nakama_user_id: ctx.userId,
+       display_name: ctx.username || "",
+-    },
+-    "",
+-    ""
++    }),
++    MODULE_CONFIG.httpTimeoutMs,
++    false
+   );
+   if (response.code < 200 || response.code >= 300) {
+     throw new Error("identity exchange failed");
+@@ -2652,3 +2659,14 @@ if (typeof module !== "undefined" && module.exports) {
+     },
+   };
+ }
++
++function nakamaExchangeHeaders() {
++  if (!String(MODULE_CONFIG.gameId || "").trim()) {
++    throw new Error("server game ID is required for identity exchange");
++  }
++  var key = MODULE_CONFIG.nakamaExchangeKey;
++  if (typeof key !== "string" || key.length < 32 || !/^[A-Za-z0-9_-]+$/.test(key)) {
++    throw new Error("TPX_NAKAMA_EXCHANGE_KEY is not configured correctly");
++  }
++  return { "Content-Type": "application/json", "x-nakama-exchange-key": key };
++}
+diff --git a/backend/nakama/render/start.sh b/backend/nakama/render/start.sh
+index a81e266..6281fa4 100644
+--- a/backend/nakama/render/start.sh
++++ b/backend/nakama/render/start.sh
+@@ -75,6 +75,12 @@ RUNTIME_ENV_TPX_API_KEY="${TPX_PLATFORM_API_KEY:-}"
+ RUNTIME_ENV_TPX_IAP_VERIFY_URL="${TPX_PLATFORM_IAP_VERIFY_URL:-}"
+ RUNTIME_ENV_TPX_IAP_ENTITLEMENTS_URL="${TPX_PLATFORM_IAP_ENTITLEMENTS_URL:-}"
+ RUNTIME_ENV_TPX_IAP_COINS_ADJUST_URL="${TPX_PLATFORM_IAP_COINS_ADJUST_URL:-}"
++# The generated runtime YAML uses double-quoted strings. Accept a safe credential
++# alphabet and never print its value in errors. Empty disables exchange only.
++RUNTIME_ENV_TPX_NAKAMA_EXCHANGE_KEY="${TPX_NAKAMA_EXCHANGE_KEY:-}"
++case "$RUNTIME_ENV_TPX_NAKAMA_EXCHANGE_KEY" in
++  *[!A-Za-z0-9_-]*) echo "TPX_NAKAMA_EXCHANGE_KEY has an invalid format"; exit 1 ;;
++esac
+ RUNTIME_ENV_TPX_IDENTITY_NAKAMA_AUTH_URL="${TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL:-}"
+ RUNTIME_ENV_TPX_MERGE_CODE_URL="${TPX_PLATFORM_ACCOUNT_MERGE_CODE_URL:-}"
+ RUNTIME_ENV_TPX_MERGE_REDEEM_URL="${TPX_PLATFORM_ACCOUNT_MERGE_REDEEM_URL:-}"
+@@ -95,6 +101,10 @@ RUNTIME_ENV_LEADERBOARD_ID="${LUMARUSH_LEADERBOARD_ID:-lumarush_high_scores}"
+ NAKAMA_SOCKET_PORT="${NAKAMA_SOCKET_PORT:-7354}"
+ NAKAMA_CONSOLE_PORT="${NAKAMA_CONSOLE_PORT:-7355}"
+ 
++# Keep generated server credentials readable only by the container user.
++umask 077
++touch /tmp/render-local.yml
++chmod 600 /tmp/render-local.yml
+ cat > /tmp/render-local.yml <<EOF
+ name: "lumarush-nakama"
+ logger:
+@@ -123,6 +133,7 @@ runtime:
+     - "TPX_PLATFORM_IAP_ENTITLEMENTS_URL=${RUNTIME_ENV_TPX_IAP_ENTITLEMENTS_URL}"
+     - "TPX_PLATFORM_IAP_COINS_ADJUST_URL=${RUNTIME_ENV_TPX_IAP_COINS_ADJUST_URL}"
+     - "TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL=${RUNTIME_ENV_TPX_IDENTITY_NAKAMA_AUTH_URL}"
++    - "TPX_NAKAMA_EXCHANGE_KEY=${RUNTIME_ENV_TPX_NAKAMA_EXCHANGE_KEY}"
+     - "TPX_PLATFORM_ACCOUNT_MERGE_CODE_URL=${RUNTIME_ENV_TPX_MERGE_CODE_URL}"
+     - "TPX_PLATFORM_ACCOUNT_MERGE_REDEEM_URL=${RUNTIME_ENV_TPX_MERGE_REDEEM_URL}"
+     - "TPX_PLATFORM_MAGIC_LINK_START_URL=${RUNTIME_ENV_TPX_MAGIC_LINK_START_URL}"
+diff --git a/backend/nakama/tests/identity_exchange.test.js b/backend/nakama/tests/identity_exchange.test.js
+new file mode 100644
+index 0000000..f35b067
+--- /dev/null
++++ b/backend/nakama/tests/identity_exchange.test.js
+@@ -0,0 +1,136 @@
++const test = require("node:test");
++const assert = require("node:assert/strict");
++const fs = require("node:fs");
++const path = require("node:path");
++const vm = require("node:vm");
++
++const key = "test-only-lumarush-backend-key-32-bytes";
++function loadModule(name, overrides = {}) {
++  const context = vm.createContext({});
++  const source = fs.readFileSync(path.join(__dirname, "../modules", name), "utf8");
++  vm.runInContext(source, context, { filename: name });
++  const env = {
++    GAME_ID: "lumarush",
++    TPX_GAME_ID: "lumarush",
++    PLATFORM_IDENTITY_URL: "https://identity.test",
++    TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL: "https://identity.test/v1/auth/nakama",
++    TPX_NAKAMA_EXCHANGE_KEY: key,
++    ...overrides,
++  };
++  context.MODULE_CONFIG = context.loadConfig({ env });
++  const calls = [];
++  const nk = {
++    httpRequest(url, method, headers, body) {
++      calls.push({ url, method, headers, body: JSON.parse(body) });
++      return { code: 200, body: JSON.stringify({ session_token: "platform-test-session" }) };
++    },
++  };
++  return { context, calls, nk };
++}
++
++for (const name of ["index.js", "lumarush.js"]) {
++  test(`${name}: refuses missing/invalid authenticated context before HTTP`, () => {
++    const { context, calls, nk } = loadModule(name);
++    for (const ctx of [undefined, {}, { userId: "" }, { userId: " " }, { userId: 42 }]) {
++      assert.throws(() => context.exchangePlatformSession(ctx, nk), /User session is required/);
++    }
++    assert.equal(calls.length, 0);
++  });
++
++  test(`${name}: fails closed without dedicated credential or configured game`, () => {
++    for (const badKey of ["", "short", "invalid-key-with-newline\n", " ".repeat(40)]) {
++      const { context, calls, nk } = loadModule(name, { TPX_NAKAMA_EXCHANGE_KEY: badKey, TPX_PLATFORM_INTERNAL_KEY: key, PLATFORM_INTERNAL_KEY: key, TPX_PLATFORM_API_KEY: key });
++      assert.throws(() => context.exchangePlatformSession({ userId: "caller" }, nk), /TPX_NAKAMA_EXCHANGE_KEY/);
++      assert.equal(calls.length, 0);
++    }
++    const { context, calls, nk } = loadModule(name);
++    context.MODULE_CONFIG.gameId = "";
++    assert.throws(() => context.exchangePlatformSession({ userId: "caller" }, nk), /server game ID/);
++    assert.equal(calls.length, 0);
++  });
++
++  test(`${name}: exchanges authenticated user under server game and dedicated header`, () => {
++    const { context, calls, nk } = loadModule(name);
++    const session = context.exchangePlatformSession({ userId: "caller", username: "Player", game_id: "other-game", nakama_user_id: "victim", env: { TPX_NAKAMA_EXCHANGE_KEY: "request-key", TPX_GAME_ID: "other-game" } }, nk);
++    assert.equal(session, "platform-test-session");
++    assert.equal(calls.length, 1);
++    assert.equal(calls[0].url, "https://identity.test/v1/auth/nakama");
++    assert.equal(calls[0].body.game_id, "lumarush");
++    assert.equal(calls[0].body.nakama_user_id, "caller");
++    assert.equal(calls[0].headers["x-nakama-exchange-key"], key);
++    assert.equal(calls[0].headers["x-admin-key"], undefined);
++    assert.equal(calls[0].headers.Authorization, undefined);
++    assert.equal(JSON.stringify(calls[0].body).includes(key), false);
++  });
++
++  test(`${name}: dedicated credential is not attached to other platform requests`, () => {
++    const { context, calls, nk } = loadModule(name);
++    if (name === "lumarush.js") {
++      context.platformPost(nk, "https://platform.test/unrelated", {}, "", "session");
++    } else {
++      context.httpPost(nk, "https://platform.test/unrelated", {}, {}, "session");
++    }
++    assert.equal(calls[0].headers["x-nakama-exchange-key"], undefined);
++  });
++
++  test(`${name}: does not return sessions on platform rejection`, () => {
++    const { context, nk } = loadModule(name);
++    nk.httpRequest = () => ({ code: 401, body: "{}" });
++    assert.throws(() => context.exchangePlatformSession({ userId: "caller" }, nk), /exchange failed/);
++  });
++}
++
++test("template RPC ignores payload-selected user/game/credential and requires authentication", () => {
++  const { context, calls, nk } = loadModule("index.js");
++  const payload = JSON.stringify({ nakama_user_id: "victim", game_id: "other-game", backendKey: "request-key", TPX_NAKAMA_EXCHANGE_KEY: "request-key" });
++  for (const ctx of [undefined, {}, { userId: " " }, { userId: 42 }]) {
++    assert.throws(() => context.rpcPlatformAuthExchange(ctx, {}, nk, payload), /User session is required/);
++  }
++  assert.equal(calls.length, 0);
++  context.rpcPlatformAuthExchange({ userId: "caller", username: "Player" }, {}, nk, payload);
++  assert.equal(calls.length, 1);
++  assert.equal(calls[0].body.nakama_user_id, "caller");
++  assert.equal(calls[0].body.game_id, "lumarush");
++  assert.equal(calls[0].headers["x-nakama-exchange-key"], key);
++});
++
++test("checked-in local and container startup select the tested LumaRush module", () => {
++  const local = fs.readFileSync(path.join(__dirname, "../local.yml"), "utf8");
++  const startup = fs.readFileSync(path.join(__dirname, "../render/start.sh"), "utf8");
++  assert.match(local, /js_entrypoint: "lumarush\.js"/);
++  assert.match(startup, /js_entrypoint: "lumarush\.js"/);
++  assert.match(startup, /TPX_NAKAMA_EXCHANGE_KEY=\$\{RUNTIME_ENV_TPX_NAKAMA_EXCHANGE_KEY\}/);
++});
++
++test("template RPC refuses missing dedicated credential before HTTP", () => {
++  const { context, calls, nk } = loadModule("index.js", { TPX_NAKAMA_EXCHANGE_KEY: "" });
++  assert.throws(() => context.rpcPlatformAuthExchange({ userId: "caller" }, {}, nk, "{}"), /TPX_NAKAMA_EXCHANGE_KEY/);
++  assert.equal(calls.length, 0);
++});
++
++test("module initialization independently registers the expected entrypoint RPCs", () => {
++  for (const name of ["index.js", "lumarush.js"]) {
++    const { context, nk } = loadModule(name);
++    const registered = new Map();
++    const initializer = new Proxy({}, {
++      get(_target, property) {
++        if (property === "registerRpc") return (id, handler) => {
++          assert.equal(registered.has(id), false, `duplicate RPC ${id} in ${name}`);
++          registered.set(id, handler);
++        };
++        return () => {};
++      },
++    });
++    nk.leaderboardCreate = () => {};
++    const logger = { info() {} };
++    context.InitModule({ env: {
++      GAME_ID: "lumarush", TPX_GAME_ID: "lumarush",
++      TPX_NAKAMA_EXCHANGE_KEY: key,
++      PLATFORM_IDENTITY_URL: "https://identity.test",
++      TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL: "https://identity.test/v1/auth/nakama",
++    } }, logger, nk, initializer);
++    assert.equal(registered.has("platform_auth_exchange"), name === "index.js");
++    assert.equal(registered.has("tpx_account_magic_link_start"), true);
++    assert.equal(context.exchangePlatformSession({ userId: "caller" }, nk), "platform-test-session");
++  }
++});
+-- 
+2.39.3 (Apple Git-145)
+

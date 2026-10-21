@@ -1,0 +1,3271 @@
+From 219a5ed43e94cb5e54f1273c3b9162c2eaba5bf0 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 13:42:25 -0500
+Subject: [PATCH 1/6] Require game-scoped backend proof for Nakama identity
+ exchange
+
+---
+ services/identity-gateway/README.md           | 60 +++++++++++++
+ services/identity-gateway/src/httpServer.js   |  8 +-
+ .../src/identityGatewayService.js             | 40 +++++++++
+ services/identity-gateway/src/main.js         |  1 +
+ test/identity-gateway-http.test.js            |  3 +
+ test/identity-gateway.test.js                 |  9 ++
+ test/nakama-exchange-auth.test.js             | 89 +++++++++++++++++++
+ 7 files changed, 208 insertions(+), 2 deletions(-)
+ create mode 100644 test/nakama-exchange-auth.test.js
+
+diff --git a/services/identity-gateway/README.md b/services/identity-gateway/README.md
+index e8c7349..2e78231 100644
+--- a/services/identity-gateway/README.md
++++ b/services/identity-gateway/README.md
+@@ -110,3 +110,63 @@ Optional env:
+ Notes:
+ - Magic-link web completion redirect now returns only `tpx_auth=1` (no identity PII query params).
+ - Browser identity should hydrate via `GET /v1/web/session` cookie check.
++
++### Nakama backend exchange authentication and rollout
++
++`POST /v1/auth/nakama` is a backend-only exchange. Configure
++`NAKAMA_EXCHANGE_KEYS_JSON` as a secret JSON object mapping normalized game IDs
++(lowercase, no surrounding whitespace) to distinct backend credentials of at least
++32 bytes. No credentials are supplied by this repository. Missing/empty configuration
++leaves the Nakama exchange disabled (401); malformed configuration stops startup.
++There is no fallback to `INTERNAL_SERVICE_KEY`, `IDENTITY_ADMIN_KEY`, platform
++sessions, Nakama HTTP keys, or a shared cross-game key.
++
++The trusted backend sends its game's credential in `x-nakama-exchange-key`, over
++HTTPS, with `game_id`, `nakama_user_id`, and optional `display_name`. The credential
++only authorizes its configured game. Treat it as authority to assert any identity
++within that game: keep it server-side, out of game exports, logs and source control.
++The backend MUST require an authenticated Nakama context and derive the user ID
++from `ctx.userId`; never forward a client-selected user ID. This is backend
++assertion authentication, not verification of a Nakama player session JWT.
++Issued sessions retain the configured `SESSION_ISSUER` and `SESSION_AUDIENCE` and
++include `game_id` and `nakama_user_id`. Request bodies cannot override audience or
++issuance time. Consumers requiring game isolation must validate `game_id` as well
++as the platform audience; this patch does not change downstream authorization.
++Public web/magic-link routes and CrazyGames verification are unchanged.
++
++Rollout prerequisites (not performed by this patch):
++
++1. Provision distinct per-game, per-environment credentials through approved secret
++   management and configure the gateway's `NAKAMA_EXCHANGE_KEYS_JSON`.
++2. Update every backend exchange caller to send `x-nakama-exchange-key` and use
++   only authenticated `ctx.userId`. Coordinate caller/configuration rollout before
++   enabling exchange; old callers intentionally receive 401 after this patch.
++3. Test with controlled staging accounts from a commit merged to `main`, then
++   promote that reviewed main revision to production. Never test forged production
++   identities. Removal of a game's mapping revokes its ability to exchange;
++   existing issued platform sessions remain valid until expiry.
++
++Read-only caller inspection found `LumaRush/backend/nakama/modules/index.js` has
++both `rpcPlatformAuthExchange` and `exchangePlatformSession` calling this route
++without proof. The RPC currently prefers payload `nakama_user_id` over `ctx.userId`;
++that must be corrected before giving this backend an exchange credential.
++`LumaRush/backend/nakama/modules/lumarush.js` also exchanges without proof, using
++`ctx.userId` and `TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL`. The canonical
++`Terapixel-Games/ArcadeCore` repository was unavailable (GitHub returned repository
++not found), so its `backend/templates/nakama-game-backend` could not be verified;
++update/audit the canonical template and all generated backends before rollout.
++Caller repositories were not modified.
++
++Source review confirms this route previously minted sessions from supplied IDs,
++`main.js` added no caller authentication, and the Cloud Run manifest declares the
++identity service public. Actual deployed exposure has not been verified.
++
++Release trigger review: `.github/workflows/cloudrun-deploy.yml` runs on pushes to
++`main` (staging), version tags `v*` (production), and manual dispatch. Deploys are
++conditional on environment `CLOUDRUN_ENABLED`; live variable values were not
++inspected. CI tests and deployment are separate workflows, so deployment does not
++wait for the CI workflow. Render deployment is manual. Branch pushes and PRs do
++not trigger the checked-in deployment workflows. Tag/manual workflows do not
++currently enforce ancestry from main; release operators must select a reviewed
++main revision. No merge, tag, workflow dispatch, deployment, or live configuration
++change is part of this patch.
+diff --git a/services/identity-gateway/src/httpServer.js b/services/identity-gateway/src/httpServer.js
+index de91f46..2890f42 100644
+--- a/services/identity-gateway/src/httpServer.js
++++ b/services/identity-gateway/src/httpServer.js
+@@ -1,5 +1,6 @@
+ import http from "node:http";
+ import crypto from "node:crypto";
++import { NakamaExchangeAuthError } from "./identityGatewayService.js";
+ import {
+   JwtValidationError,
+   createSessionToken,
+@@ -99,6 +100,9 @@ export function createIdentityGatewayHttpServer(options = {}) {
+         requestId
+       });
+     } catch (error) {
++      if (error instanceof NakamaExchangeAuthError) {
++        error = new HttpError(401, "unauthorized", error.message);
++      }
+       if (error instanceof HttpError) {
+         writeJson(res, error.statusCode, {
+           request_id: requestId,
+@@ -353,8 +357,8 @@ async function handleRequest(req, res, ctx) {
+     const result = await ctx.service.authenticateNakamaUser({
+       nakamaUserId,
+       gameId,
+-      displayName: body.display_name,
+-      nowSeconds: body.nowSeconds
++      backendKey: req.headers["x-nakama-exchange-key"],
++      displayName: body.display_name
+     });
+     writeJson(res, 200, {
+       request_id: ctx.requestId,
+diff --git a/services/identity-gateway/src/identityGatewayService.js b/services/identity-gateway/src/identityGatewayService.js
+index d2a6499..8c3f3da 100644
+--- a/services/identity-gateway/src/identityGatewayService.js
++++ b/services/identity-gateway/src/identityGatewayService.js
+@@ -4,6 +4,7 @@ import { createSessionToken } from "../../../packages/shared-utils/index.js";
+ import { InMemoryIdentityStore } from "./identityStore.js";
+ 
+ export function createIdentityGatewayService(options = {}) {
++  const nakamaExchangeKeys = parseNakamaExchangeKeys(options.nakamaExchangeKeysJson);
+   const identityStore = options.identityStore || new InMemoryIdentityStore();
+   const mergeCoordinator = options.mergeCoordinator || createNoopMergeCoordinator();
+   const magicLinkCompletionNotifier =
+@@ -99,6 +100,14 @@ export function createIdentityGatewayService(options = {}) {
+       if (!nakamaUserId) {
+         throw new Error("nakamaUserId is required");
+       }
++      const expectedKey = nakamaExchangeKeys[gameId];
++      const suppliedKey = typeof input?.backendKey === "string" ? input.backendKey : "";
++      if (!expectedKey || !suppliedKey || !crypto.timingSafeEqual(
++        crypto.createHash("sha256").update(expectedKey || "").digest(),
++        crypto.createHash("sha256").update(suppliedKey).digest()
++      )) {
++        throw new NakamaExchangeAuthError();
++      }
+       const now = normalizeNow(input?.nowSeconds);
+       const existing = await identityStore.findPlayerByNakama(gameId, nakamaUserId);
+       if (existing) {
+@@ -119,6 +128,7 @@ export function createIdentityGatewayService(options = {}) {
+           player: updated,
+           ...buildSession(updated.playerId, now, sessionConfig, {
+             nakamaUserId,
++            gameId,
+             displayName: updated.displayName
+           })
+         };
+@@ -140,6 +150,7 @@ export function createIdentityGatewayService(options = {}) {
+         player,
+         ...buildSession(primaryProfileId, now, sessionConfig, {
+           nakamaUserId,
++          gameId,
+           displayName: player.displayName
+         })
+       };
+@@ -379,6 +390,7 @@ function buildSession(profileId, now, sessionConfig, identityContext = {}) {
+     {
+       sub: profileId,
+       scope: "player_session",
++      game_id: normalizeGameId(identityContext.gameId) || undefined,
+       nakama_user_id: nakamaUserId || undefined,
+       display_name: displayName || undefined,
+       email: email || undefined
+@@ -615,3 +627,31 @@ function dedupeTokens(values) {
+   }
+   return out;
+ }
++
++// Dedicated, per-game backend credentials. Never fall back to platform admin keys.
++export class NakamaExchangeAuthError extends Error {
++  constructor() {
++    super("Nakama backend authentication required");
++    this.name = "NakamaExchangeAuthError";
++  }
++}
++
++export function parseNakamaExchangeKeys(raw) {
++  if (raw === undefined || raw === "") return Object.create(null);
++  let parsed;
++  try { parsed = JSON.parse(raw); } catch { throw new Error("NAKAMA_EXCHANGE_KEYS_JSON must be a JSON object"); }
++  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
++    throw new Error("NAKAMA_EXCHANGE_KEYS_JSON must be a JSON object");
++  }
++  const keys = Object.create(null);
++  const seen = new Set();
++  for (const [gameId, key] of Object.entries(parsed)) {
++    if (!gameId || gameId !== normalizeGameId(gameId) || typeof key !== "string" ||
++        key !== key.trim() || Buffer.byteLength(key) < 32 || seen.has(key)) {
++      throw new Error("NAKAMA_EXCHANGE_KEYS_JSON requires normalized game IDs and unique keys of at least 32 bytes");
++    }
++    keys[gameId] = key;
++    seen.add(key);
++  }
++  return keys;
++}
+diff --git a/services/identity-gateway/src/main.js b/services/identity-gateway/src/main.js
+index fb9dc33..7c227be 100644
+--- a/services/identity-gateway/src/main.js
++++ b/services/identity-gateway/src/main.js
+@@ -26,6 +26,7 @@ async function main() {
+ 
+   const service = createIdentityGatewayService({
+     identityStore: await createIdentityStore(config),
++    nakamaExchangeKeysJson: process.env.NAKAMA_EXCHANGE_KEYS_JSON,
+     mergeCoordinator: createHttpMergeCoordinator({
+       adminKey: config.internalServiceKey,
+       iapMergeUrl: config.iapMergeUrl,
+diff --git a/test/identity-gateway-http.test.js b/test/identity-gateway-http.test.js
+index e050db1..4ec47ef 100644
+--- a/test/identity-gateway-http.test.js
++++ b/test/identity-gateway-http.test.js
+@@ -17,6 +17,7 @@ describe("identity-gateway http", () => {
+   const sessionSecret = "identity-session-secret-12345";
+   let lastMagicLink = "";
+   const service = createIdentityGatewayService({
++    nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+     sessionSecret,
+     sessionIssuer: "terapixel.identity",
+     sessionAudience: "terapixel.game",
+@@ -90,6 +91,7 @@ describe("identity-gateway http", () => {
+     const response = await fetch(`${baseUrl}/v1/auth/nakama`, {
+       method: "POST",
+       headers: {
++        "x-nakama-exchange-key": "test-lumarush-backend-key-32-bytes-long",
+         "content-type": "application/json"
+       },
+       body: JSON.stringify({
+@@ -271,6 +273,7 @@ describe("identity-gateway http", () => {
+     const authResponse = await fetch(`${baseUrl}/v1/auth/nakama`, {
+       method: "POST",
+       headers: {
++        "x-nakama-exchange-key": "test-lumarush-backend-key-32-bytes-long",
+         "content-type": "application/json"
+       },
+       body: JSON.stringify({
+diff --git a/test/identity-gateway.test.js b/test/identity-gateway.test.js
+index 56ab086..d3bcb45 100644
+--- a/test/identity-gateway.test.js
++++ b/test/identity-gateway.test.js
+@@ -23,12 +23,14 @@ describe("identity-gateway service", () => {
+   it("authenticates nakama user and mints session with nakama claim", async () => {
+     const now = 1_800_000_050;
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       sessionSecret: "identity-session-secret-12345",
+       sessionIssuer: "terapixel.identity",
+       sessionAudience: "terapixel.game",
+       sessionTtlSeconds: 300
+     });
+     const result = await service.authenticateNakamaUser({
++      backendKey: "test-lumarush-backend-key-32-bytes-long",
+       gameId: "lumarush",
+       nakamaUserId: "nk-user-1",
+       nowSeconds: now
+@@ -48,18 +50,21 @@ describe("identity-gateway service", () => {
+   it("creates and redeems merge code", async () => {
+     const now = 1_800_000_100;
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       sessionSecret: "identity-session-secret-12345",
+       sessionIssuer: "terapixel.identity",
+       sessionAudience: "terapixel.game",
+       sessionTtlSeconds: 300
+     });
+     const primaryAuth = await service.authenticateNakamaUser({
++      backendKey: "test-lumarush-backend-key-32-bytes-long",
+       gameId: "lumarush",
+       nakamaUserId: "primary",
+       displayName: "PrimeUser",
+       nowSeconds: now
+     });
+     const secondaryAuth = await service.authenticateNakamaUser({
++      backendKey: "test-lumarush-backend-key-32-bytes-long",
+       gameId: "lumarush",
+       nakamaUserId: "secondary",
+       nowSeconds: now + 1
+@@ -96,6 +101,7 @@ describe("identity-gateway service", () => {
+     const keyStore = createStaticKeyStore(publicKey, "cg-kid");
+     const now = 1_800_000_000;
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       sessionSecret: "identity-session-secret-12345",
+       sessionIssuer: "terapixel.identity",
+       sessionAudience: "terapixel.game",
+@@ -122,6 +128,7 @@ describe("identity-gateway service", () => {
+ 
+   it("upgrades new email link via magic link completion", async () => {
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       magicLinkBaseUrl: "https://terapixel.games/auth/magic-link"
+     });
+     const token = await service.identityStore.createMagicLinkToken(
+@@ -139,6 +146,7 @@ describe("identity-gateway service", () => {
+ 
+   it("merges when email is linked to another profile", async () => {
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       magicLinkBaseUrl: "https://terapixel.games/auth/magic-link"
+     });
+     await service.identityStore.upsertEmailLink("linked@example.com", "nk_primary");
+@@ -158,6 +166,7 @@ describe("identity-gateway service", () => {
+ 
+   it("validates username moderation with global and game blocklists", async () => {
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       usernameModerationGlobalTokens: ["admin", "support"],
+       usernameModerationByGame: {
+         lumarush: ["lumaevil"]
+diff --git a/test/nakama-exchange-auth.test.js b/test/nakama-exchange-auth.test.js
+new file mode 100644
+index 0000000..639699f
+--- /dev/null
++++ b/test/nakama-exchange-auth.test.js
+@@ -0,0 +1,89 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { createIdentityGatewayService, createIdentityGatewayHttpServer } from "../services/identity-gateway/index.js";
++import { parseNakamaExchangeKeys } from "../services/identity-gateway/src/identityGatewayService.js";
++import { verifySessionToken } from "../packages/shared-utils/index.js";
++
++const keyA = "test-game-a-backend-key-at-least-32-bytes";
++const keyB = "test-game-b-backend-key-at-least-32-bytes";
++const config = JSON.stringify({ a: keyA, b: keyB });
++const sessionSecret = "test-platform-session-signing-secret";
++
++describe("Nakama exchange backend authentication", () => {
++  it("rejects malformed configuration without echoing secrets", () => {
++    for (const raw of ["{", "null", "[]", JSON.stringify({ A: keyA }), JSON.stringify({ a: "short" }), JSON.stringify({ a: keyA, b: keyA })]) {
++      assert.throws(() => parseNakamaExchangeKeys(raw), /NAKAMA_EXCHANGE_KEYS_JSON/);
++    }
++  });
++
++  it("fails closed in the service before touching identity storage", async () => {
++    for (const raw of [undefined, "{}", config]) {
++      const service = createIdentityGatewayService({ nakamaExchangeKeysJson: raw, identityStore: new Proxy({}, { get() { throw new Error("storage touched"); } }) });
++      for (const backendKey of [undefined, "", "wrong", keyB]) {
++        await assert.rejects(service.authenticateNakamaUser({ gameId: "a", nakamaUserId: "victim", backendKey }), { name: "NakamaExchangeAuthError" });
++      }
++    }
++  });
++
++  it("rejects unauthenticated HTTP requests and binds successful sessions to game and configured audience", async () => {
++    const service = createIdentityGatewayService({ nakamaExchangeKeysJson: config, sessionSecret, sessionAudience: "test.platform" });
++    const server = createIdentityGatewayHttpServer({ service, sessionSecret, internalServiceKey: "admin-key" });
++    const { baseUrl } = await server.listen();
++    try {
++      for (const [gameId, headers] of [
++        ["a", {}], ["a", { "x-nakama-exchange-key": "wrong" }],
++        ["a", { "x-admin-key": "admin-key" }],
++        ["a", { authorization: `Bearer ${keyA}` }],
++        ["a", { "x-nakama-exchange-key": keyB }],
++        ["unknown", { "x-nakama-exchange-key": keyA }]
++      ]) {
++        const response = await fetch(`${baseUrl}/v1/auth/nakama`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ game_id: gameId, nakama_user_id: "victim", backendKey: keyA }) });
++        assert.equal(response.status, 401);
++        assert.equal((await response.json()).session_token, undefined);
++      }
++      const before = Math.floor(Date.now() / 1000);
++      const response = await fetch(`${baseUrl}/v1/auth/nakama`, { method: "POST", headers: { "content-type": "application/json", "x-nakama-exchange-key": keyA }, body: JSON.stringify({ game_id: " A ", nakama_user_id: "user-1", nowSeconds: 4_000_000_000, audience: "attacker" }) });
++      assert.equal(response.status, 200);
++      const result = await response.json();
++      const claims = verifySessionToken(result.session_token, sessionSecret, { issuer: "terapixel.identity", audience: "test.platform" });
++      assert.equal(claims.game_id, "a");
++      assert.equal(claims.nakama_user_id, "user-1");
++      assert.ok(claims.iat >= before && claims.iat <= Math.floor(Date.now() / 1000));
++      assert.throws(() => verifySessionToken(result.session_token, sessionSecret, { audience: "attacker" }));
++    } finally { await server.close(); }
++  });
++
++  it("isolates identical user IDs across games and preserves game binding on repeat exchange", async () => {
++    const service = createIdentityGatewayService({ nakamaExchangeKeysJson: config, sessionSecret });
++    const a = await service.authenticateNakamaUser({ gameId: "a", nakamaUserId: "same-user", backendKey: keyA });
++    const b = await service.authenticateNakamaUser({ gameId: "b", nakamaUserId: "same-user", backendKey: keyB });
++    assert.notEqual(a.player.playerId, b.player.playerId);
++    const again = await service.authenticateNakamaUser({ gameId: "a", nakamaUserId: "same-user", backendKey: keyA });
++    assert.equal(again.isNewPlayer, false);
++    assert.equal(again.player.playerId, a.player.playerId);
++    assert.equal(verifySessionToken(again.sessionToken, sessionSecret, { audience: "terapixel.game" }).game_id, "a");
++  });
++
++  it("keeps public health and magic-link routes available with exchange disabled", async () => {
++    let linkUrl = "";
++    const service = createIdentityGatewayService({
++      sessionSecret,
++      magicLinkBaseUrl: "http://identity.test/v1/account/magic-link/consume",
++      magicLinkEmailSender: { sendMagicLink: async (input) => { linkUrl = input.linkUrl; } }
++    });
++    const server = createIdentityGatewayHttpServer({ service, sessionSecret });
++    const { baseUrl } = await server.listen();
++    try {
++      const denied = await fetch(`${baseUrl}/v1/auth/nakama`, { method: "POST", headers: { "content-type": "application/json", "x-nakama-exchange-key": keyA }, body: JSON.stringify({ game_id: "a", nakama_user_id: "victim" }) });
++      assert.equal(denied.status, 401);
++      assert.equal((await fetch(`${baseUrl}/healthz`)).status, 200);
++      assert.equal((await fetch(`${baseUrl}/v1/web/session`)).status, 200);
++      assert.equal((await fetch(`${baseUrl}/v1/web/login?email=player%40example.test`)).status, 200);
++      assert.ok(linkUrl);
++      const consume = new URL(linkUrl);
++      const completed = await fetch(`${baseUrl}${consume.pathname}${consume.search}`, { redirect: "manual" });
++      assert.equal(completed.status, 200);
++      assert.ok(completed.headers.get("set-cookie"));
++    } finally { await server.close(); }
++  });
++});
+-- 
+2.39.3 (Apple Git-145)
+
+
+From 20ffb8579cb9679cd6c38c75ee1213fae6ea9bb9 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 13:54:24 -0500
+Subject: [PATCH 2/6] Commit IAP deduplication and wallet benefits atomically
+
+---
+ services/iap-service/README.md                |  48 +++++++
+ services/iap-service/src/iapService.js        |  29 ++--
+ services/iap-service/src/store/iapStore.js    | 115 +++++++++++-----
+ .../iap-service/src/store/postgresIapStore.js |  67 ++++++++-
+ .../src/store/transactionEffect.js            |  12 ++
+ test/iap-atomicity.test.js                    | 130 ++++++++++++++++++
+ test/postgres-iap-atomicity.test.js           | 106 ++++++++++++++
+ test/postgres-iap-integration.test.js         |  68 +++++++++
+ 8 files changed, 512 insertions(+), 63 deletions(-)
+ create mode 100644 services/iap-service/src/store/transactionEffect.js
+ create mode 100644 test/iap-atomicity.test.js
+ create mode 100644 test/postgres-iap-atomicity.test.js
+ create mode 100644 test/postgres-iap-integration.test.js
+
+diff --git a/services/iap-service/README.md b/services/iap-service/README.md
+index fe7b006..9016c5a 100644
+--- a/services/iap-service/README.md
++++ b/services/iap-service/README.md
+@@ -55,3 +55,51 @@ Purpose: purchase verification and entitlement source of truth.
+ - `poki` -> `paypal_web`
+ - `crazygames` -> `paypal_web`
+ - `web` -> `paypal_web`
++
++## Atomic purchase grants and wallet adjustments
++
++`verifyPurchase` and `adjustCoins` use the store contract
++`applyTransaction(provider, externalTransactionId, record, effect)`. `effect` is
++one coin delta (`{ coins: { gameId, delta } }`) or the existing normalized
++subscription value. The successful deduplication record and benefit are committed
++together; insufficient funds or a failed grant does not consume the success key.
++Concurrent duplicate transactions apply once. Distinct concurrent spends use a
++conditional debit and cannot spend more than the available wallet balance.
++Integer deltas/balances use the existing PostgreSQL signed INT range.
++
++PostgreSQL uses `pool.connect()` and one pinned client for BEGIN, dedupe INSERT,
++conditional wallet UPDATE (or existing subscription write), and COMMIT. Errors
++ROLLBACK before releasing; rollback failures discard the connection and preserve
++the original error. A response/connection failure around COMMIT can leave the
++caller uncertain about success; retry with the same key rather than a new key.
++The committed record prevents a repeated grant after a successful commit.
++No schema migration is required. Historical records that were already saved
++without a matching grant are not repaired automatically by this patch.
++
++The memory implementation publishes each operation without asynchronous gaps.
++The JSON file implementation serializes these transactions, writes a staged
++snapshot using the existing temporary-file/rename pattern, then publishes the
++in-memory state. A failed snapshot write leaves the operation retryable. File
++mode is single-instance/single-writer only; it provides no cross-process locking
++or fsync-based power-loss durability. Legacy standalone store mutators remain
++for existing setup/merge paths; do not compose them for purchase/wallet writes.
++Concurrent profile merges versus wallet operations are outside this patch and
++have not been made transactionally safe. Subscription/provider/webhook behavior
++and save/merge implementations are otherwise unchanged.
++
++Validation:
++
++- `node --test test/iap-atomicity.test.js test/postgres-iap-atomicity.test.js`:
++  memory/file concurrency, fault and retry coverage plus scripted PostgreSQL
++  pinned-client/rollback tests. The latter mocks SQL responses and does not prove
++  real PostgreSQL lock behavior.
++- `test/postgres-iap-integration.test.js` is an opt-in real PostgreSQL test. With
++  dependencies installed and an already-running disposable local database,
++  supply `IAP_TEST_LOCAL_DATABASE_URL` pointing only to loopback, with no URL query
++  parameters, and run `node --test test/postgres-iap-integration.test.js`.
++  It creates/drops an isolated schema, injects a grant failure with a database
++  trigger, and tests concurrent duplicate grants/spends and funded retries.
++  It never reads `DATABASE_URL` and is skipped unless explicitly configured.
++
++No database/server, credentials, or live settings are provisioned by these changes.
++Review and merge this independent patch to main before staging or production.
+diff --git a/services/iap-service/src/iapService.js b/services/iap-service/src/iapService.js
+index 8140bdf..fb49cb0 100644
+--- a/services/iap-service/src/iapService.js
++++ b/services/iap-service/src/iapService.js
+@@ -60,7 +60,7 @@ export function createIapService(options = {}) {
+         gameId: normalizedGameId,
+         iapProviderConfigs
+       });
+-      const dedupe = await store.recordTransaction(
++      const dedupe = await store.applyTransaction(
+         normalized.provider,
+         normalized.externalTransactionId,
+         {
+@@ -69,7 +69,10 @@ export function createIapService(options = {}) {
+           type: normalized.type,
+           productId: normalized.productId,
+           normalized
+-        }
++        },
++        normalized.type === "consumable"
++          ? { coins: { gameId: normalized.gameId, delta: normalized.coinsDelta } }
++          : { subscription: normalized.subscription }
+       );
+ 
+       if (!dedupe.isNew) {
+@@ -81,12 +84,6 @@ export function createIapService(options = {}) {
+         };
+       }
+ 
+-      if (normalized.type === "consumable") {
+-        await store.addCoins(profileId, normalized.gameId, normalized.coinsDelta);
+-      } else if (normalized.subscription) {
+-        await store.upsertSubscription(profileId, normalized.subscription);
+-      }
+-
+       const entitlements = await getEntitlementsInternal(profileId);
+       return {
+         deduplicated: false,
+@@ -129,21 +126,21 @@ export function createIapService(options = {}) {
+         throw new Error("gameId is required");
+       }
+       const deltaInt = Math.floor(Number(delta) || 0);
+-      if (deltaInt === 0) {
+-        throw new Error("delta must be non-zero");
++      if (!Number.isSafeInteger(deltaInt) || deltaInt === 0) {
++        throw new Error("delta must be a finite non-zero integer");
+       }
+       const dedupeKey = String(idempotencyKey || "").trim();
+       if (!dedupeKey) {
+         throw new Error("idempotencyKey is required");
+       }
+ 
+-      const tx = await store.recordTransaction("internal_coin_adjust", dedupeKey, {
++      const tx = await store.applyTransaction("internal_coin_adjust", dedupeKey, {
+         profileId,
+         gameId: normalizedGameId,
+         type: "coin_adjust",
+         reason: String(reason || "").trim(),
+         delta: deltaInt
+-      });
++      }, { coins: { gameId: normalizedGameId, delta: deltaInt } });
+       if (!tx.isNew) {
+         const entitlements = await getEntitlementsInternal(profileId);
+         return {
+@@ -154,14 +151,6 @@ export function createIapService(options = {}) {
+         };
+       }
+ 
+-      if (deltaInt < 0) {
+-        const balances = await store.getCoins(profileId);
+-        const current = Number(balances?.[normalizedGameId]?.balance || 0);
+-        if (current + deltaInt < 0) {
+-          throw new Error("insufficient coins");
+-        }
+-      }
+-      await store.addCoins(profileId, normalizedGameId, deltaInt);
+       const entitlements = await getEntitlementsInternal(profileId);
+       return {
+         deduplicated: false,
+diff --git a/services/iap-service/src/store/iapStore.js b/services/iap-service/src/store/iapStore.js
+index 1550ffd..327a227 100644
+--- a/services/iap-service/src/store/iapStore.js
++++ b/services/iap-service/src/store/iapStore.js
+@@ -1,5 +1,6 @@
+ import fs from "node:fs/promises";
+ import path from "node:path";
++import { validateTransactionEffect } from "./transactionEffect.js";
+ 
+ export class InMemoryIapStore {
+   constructor(seed = {}) {
+@@ -9,6 +10,34 @@ export class InMemoryIapStore {
+     hydrateSeed(this, seed);
+   }
+ 
++  // No awaits between validation and publication: each call commits in one JS turn.
++  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
++    validateTransactionEffect(record, effect);
++    const key = txKey(provider, externalTransactionId);
++    if (this._transactions.has(key)) {
++      return { isNew: false, record: deepClone(this._transactions.get(key)) };
++    }
++    const copy = deepClone(record);
++    const result = { isNew: true, record: deepClone(copy) };
++    const subscription = effect.subscription ? deepClone(effect.subscription) : null;
++    let coinKey;
++    let balance;
++    if (effect.coins) {
++      coinKey = balanceKey(record.profileId, effect.coins.gameId);
++      const current = this._coinBalances.get(coinKey)?.balance || 0;
++      balance = current + effect.coins.delta;
++      if (balance < 0) throw new Error("insufficient coins");
++      if (!Number.isSafeInteger(balance) || balance > 2147483647) {
++        throw new Error("coin balance exceeds supported range");
++      }
++    }
++    // All potentially throwing input processing finishes before modifying state.
++    if (effect.coins) this._coinBalances.set(coinKey, { balance });
++    if (subscription) this._subscriptions.set(normalize(record.profileId), subscription);
++    this._transactions.set(key, copy);
++    return result;
++  }
++
+   async recordTransaction(provider, externalTransactionId, record) {
+     const key = txKey(provider, externalTransactionId);
+     if (this._transactions.has(key)) {
+@@ -92,10 +121,30 @@ export class JsonFileIapStore extends InMemoryIapStore {
+       throw new Error("JsonFileIapStore filePath is required");
+     }
+     this._filePath = filePath;
+-    this._loaded = false;
+     this._writeQueue = Promise.resolve();
+   }
+ 
++  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
++    const operation = this._writeQueue.then(async () => {
++      await this._ensureLoaded();
++      const staged = new InMemoryIapStore();
++      staged._coinBalances = new Map(this._coinBalances);
++      staged._subscriptions = new Map(this._subscriptions);
++      staged._transactions = new Map(this._transactions);
++      const result = await staged.applyTransaction(provider, externalTransactionId, record, effect);
++      if (result.isNew) {
++        await this._writeSnapshot(staged);
++        this._coinBalances = staged._coinBalances;
++        this._subscriptions = staged._subscriptions;
++        this._transactions = staged._transactions;
++      }
++      return result;
++    });
++    // A failed write must not poison retries or consume an idempotency key.
++    this._writeQueue = operation.catch(() => {});
++    return operation;
++  }
++
+   async recordTransaction(provider, externalTransactionId, record) {
+     await this._ensureLoaded();
+     const result = await super.recordTransaction(
+@@ -143,48 +192,40 @@ export class JsonFileIapStore extends InMemoryIapStore {
+   }
+ 
+   async _ensureLoaded() {
+-    if (this._loaded) {
+-      return;
+-    }
+-    this._loaded = true;
+-    await fs.mkdir(path.dirname(this._filePath), { recursive: true });
+-    try {
+-      const raw = await fs.readFile(this._filePath, "utf8");
+-      if (!raw.trim()) {
+-        return;
+-      }
+-      const parsed = JSON.parse(raw);
+-      hydrateSeed(this, parsed);
+-    } catch (error) {
+-      if (error && error.code === "ENOENT") {
+-        return;
+-      }
+-      throw error;
++    if (!this._loadPromise) {
++      this._loadPromise = (async () => {
++        await fs.mkdir(path.dirname(this._filePath), { recursive: true });
++        try {
++          const raw = await fs.readFile(this._filePath, "utf8");
++          if (raw.trim()) hydrateSeed(this, JSON.parse(raw));
++        } catch (error) {
++          if (error?.code !== "ENOENT") throw error;
++        }
++      })().catch((error) => {
++        this._loadPromise = null;
++        throw error;
++      });
+     }
++    await this._loadPromise;
+   }
+ 
+   async _enqueueWrite() {
+-    this._writeQueue = this._writeQueue.then(async () => {
+-      const serialized = JSON.stringify({
+-        coin_balances: Array.from(this._coinBalances.entries()).map(([k, v]) => ({
+-          key: k,
+-          value: v
+-        })),
+-        subscriptions: Array.from(this._subscriptions.entries()).map(([k, v]) => ({
+-          key: k,
+-          value: v
+-        })),
+-        transactions: Array.from(this._transactions.entries()).map(([k, v]) => ({
+-          key: k,
+-          value: v
+-        }))
+-      });
+-      const tmp = `${this._filePath}.tmp`;
+-      await fs.writeFile(tmp, serialized, "utf8");
+-      await fs.rename(tmp, this._filePath);
++    const operation = this._writeQueue.then(() => this._writeSnapshot(this));
++    this._writeQueue = operation.catch(() => {});
++    await operation;
++  }
++
++  async _writeSnapshot(store) {
++    const serialized = JSON.stringify({
++      coin_balances: Array.from(store._coinBalances.entries()).map(([key, value]) => ({ key, value })),
++      subscriptions: Array.from(store._subscriptions.entries()).map(([key, value]) => ({ key, value })),
++      transactions: Array.from(store._transactions.entries()).map(([key, value]) => ({ key, value }))
+     });
+-    await this._writeQueue;
++    const tmp = `${this._filePath}.tmp`;
++    await fs.writeFile(tmp, serialized, "utf8");
++    await fs.rename(tmp, this._filePath);
+   }
++
+ }
+ 
+ function hydrateSeed(store, seed) {
+diff --git a/services/iap-service/src/store/postgresIapStore.js b/services/iap-service/src/store/postgresIapStore.js
+index 248c42b..34f4f1b 100644
+--- a/services/iap-service/src/store/postgresIapStore.js
++++ b/services/iap-service/src/store/postgresIapStore.js
+@@ -1,8 +1,10 @@
++import { validateTransactionEffect } from "./transactionEffect.js";
++
+ export class PostgresIapStore {
+   constructor(options = {}) {
+     this._pool = options.pool;
+-    if (!this._pool || typeof this._pool.query !== "function") {
+-      throw new Error("PostgresIapStore requires pool.query");
++    if (!this._pool || typeof this._pool.query !== "function" || typeof this._pool.connect !== "function") {
++      throw new Error("PostgresIapStore requires pool.query and pool.connect");
+     }
+   }
+ 
+@@ -41,7 +43,56 @@ export class PostgresIapStore {
+     `);
+   }
+ 
++  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
++    validateTransactionEffect(record, effect);
++    const client = await this._pool.connect();
++    let began = false;
++    let releaseError;
++    try {
++      await client.query("BEGIN");
++      began = true;
++      const result = await this._recordTransaction(client, provider, externalTransactionId, record);
++      if (result.isNew && effect.coins) {
++        const params = [normalize(record.profileId), normalize(effect.coins.gameId), effect.coins.delta];
++        await client.query(
++          `INSERT INTO iap_coin_balances (profile_id, game_id, balance)
++           VALUES ($1, $2, 0) ON CONFLICT (profile_id, game_id) DO NOTHING`,
++          params.slice(0, 2)
++        );
++        // UPDATE locks the wallet row and rechecks this predicate after waiting
++        // for another debit. There is no separate read/check or balance clamp.
++        const updated = await client.query(
++          `UPDATE iap_coin_balances SET balance = balance + $3, updated_at = NOW()
++           WHERE profile_id = $1 AND game_id = $2
++             AND balance::bigint + $3::bigint >= 0
++           RETURNING balance`,
++          params
++        );
++        if (updated.rows.length === 0) throw new Error("insufficient coins");
++      } else if (result.isNew && effect.subscription) {
++        await this._writeSubscription(client, record.profileId, effect.subscription);
++      }
++      await client.query("COMMIT");
++      return result;
++    } catch (error) {
++      if (began) {
++        try { await client.query("ROLLBACK"); } catch (rollbackError) {
++          releaseError = rollbackError;
++        }
++      } else {
++        releaseError = error;
++      }
++      throw error;
++    } finally {
++      client.release(releaseError);
++    }
++  }
++
+   async recordTransaction(provider, externalTransactionId, record) {
++    return this._recordTransaction(this._pool, provider, externalTransactionId, record);
++  }
++
++  async _recordTransaction(executor, provider, externalTransactionId, record) {
+     const sql = `
+       INSERT INTO iap_transactions (provider, external_transaction_id, profile_id, type, product_id, raw)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+@@ -56,11 +107,11 @@ export class PostgresIapStore {
+       normalize(record?.productId),
+       JSON.stringify(record || {})
+     ];
+-    const inserted = await this._pool.query(sql, params);
++    const inserted = await executor.query(sql, params);
+     if (inserted.rows.length > 0) {
+       return { isNew: true, record: inserted.rows[0].raw };
+     }
+-    const existing = await this._pool.query(
++    const existing = await executor.query(
+       `SELECT raw FROM iap_transactions WHERE provider = $1 AND external_transaction_id = $2 LIMIT 1`,
+       [normalize(provider), normalize(externalTransactionId)]
+     );
+@@ -121,8 +172,13 @@ export class PostgresIapStore {
+   }
+ 
+   async upsertSubscription(profileId, subscription) {
++    await this._writeSubscription(this._pool, profileId, subscription);
++    return this.getSubscription(profileId);
++  }
++
++  async _writeSubscription(executor, profileId, subscription) {
+     const expiresAt = Number(subscription?.expiresAt);
+-    await this._pool.query(
++    await executor.query(
+       `
+       INSERT INTO iap_subscriptions (profile_id, provider, external_subscription_id, status, active, expires_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+@@ -145,7 +201,6 @@ export class PostgresIapStore {
+           : null
+       ]
+     );
+-    return this.getSubscription(profileId);
+   }
+ 
+   async mergeProfiles(primaryProfileId, secondaryProfileId) {
+diff --git a/services/iap-service/src/store/transactionEffect.js b/services/iap-service/src/store/transactionEffect.js
+new file mode 100644
+index 0000000..b151ce2
+--- /dev/null
++++ b/services/iap-service/src/store/transactionEffect.js
+@@ -0,0 +1,12 @@
++// Keep memory/file behavior aligned with PostgreSQL INT wallet columns.
++export function validateTransactionEffect(record, effect) {
++  if (!String(record?.profileId || "").trim()) throw new Error("profileId is required");
++  if (effect.coins && effect.subscription) throw new Error("only one transaction benefit is allowed");
++  if (effect.coins) {
++    const { gameId, delta } = effect.coins;
++    if (!String(gameId || "").trim()) throw new Error("gameId is required");
++    if (!Number.isInteger(delta) || delta < -2147483648 || delta > 2147483647) {
++      throw new Error("coin delta must be a supported integer");
++    }
++  }
++}
+diff --git a/test/iap-atomicity.test.js b/test/iap-atomicity.test.js
+new file mode 100644
+index 0000000..7f91645
+--- /dev/null
++++ b/test/iap-atomicity.test.js
+@@ -0,0 +1,130 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { createIapService, InMemoryIapStore, JsonFileIapStore } from "../services/iap-service/index.js";
++
++const providerRegistry = {
++  async verifyPurchase({ provider, catalogEntry, payload }) {
++    return { provider, externalTransactionId: payload.transaction_id, type: "consumable", gameId: catalogEntry.gameId, coinsDelta: catalogEntry.coins };
++  }
++};
++const purchase = (service, id = "purchase") => service.verifyPurchase({ profileId: "player", provider: "google", productId: "coins_500_lumarush", exportTarget: "android", payload: { transaction_id: id } });
++const adjust = (service, delta, key) => service.adjustCoins({ profileId: "player", gameId: "lumarush", delta, idempotencyKey: key });
++
++for (const kind of ["memory", "file"]) {
++  describe(`atomic ${kind} IAP operations`, () => {
++    async function withStore(run) {
++      const dir = kind === "file" ? await fs.mkdtemp(path.join(os.tmpdir(), "iap-atomic-")) : null;
++      const filePath = dir ? path.join(dir, "wallet.json") : null;
++      const store = dir ? new JsonFileIapStore({ filePath }) : new InMemoryIapStore();
++      try { await run(store, createIapService({ store, providerRegistry }), filePath); }
++      finally { if (dir) await fs.rm(dir, { recursive: true, force: true }); }
++    }
++
++    it("concurrent duplicate purchases grant exactly once", () => withStore(async (store, service, filePath) => {
++      // Legacy two-step operations must never be called by the service.
++      store.recordTransaction = store.addCoins = () => { throw new Error("non-atomic path"); };
++      const results = await Promise.all(Array.from({ length: 20 }, () => purchase(service)));
++      assert.equal(results.filter((row) => !row.deduplicated).length, 1);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 500);
++      if (filePath) assert.equal((await new JsonFileIapStore({ filePath }).getCoins("player")).lumarush.balance, 500);
++    }));
++
++    it("rejects overspend without consuming its success key; funded retry works", () => withStore(async (store, service) => {
++      await assert.rejects(adjust(service, -60, "spend"), /insufficient coins/);
++      await adjust(service, 100, "fund");
++      assert.equal((await adjust(service, -60, "spend")).deduplicated, false);
++      assert.equal((await adjust(service, -60, "spend")).deduplicated, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 40);
++    }));
++
++    it("serializes distinct and duplicate concurrent spends without overspending", () => withStore(async (store, service) => {
++      await adjust(service, 100, "fund");
++      const duplicate = await Promise.all(Array.from({ length: 12 }, () => adjust(service, -10, "same-spend")));
++      assert.equal(duplicate.filter((row) => !row.deduplicated).length, 1);
++      const results = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => adjust(service, -10, `spend-${i}`)));
++      assert.equal(results.filter((row) => row.status === "fulfilled").length, 9);
++      assert.equal(results.filter((row) => row.status === "rejected" && /insufficient coins/.test(row.reason.message)).length, 11);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 0);
++    }));
++
++    it("input/grant validation failure does not consume transaction keys", () => withStore(async (store) => {
++      const record = { profileId: "player", type: "consumable" };
++      await assert.rejects(store.applyTransaction("google", "invalid-grant", record, { coins: { gameId: "lumarush", delta: Infinity } }), /coin delta/);
++      assert.equal((await store.applyTransaction("google", "invalid-grant", record, { coins: { gameId: "lumarush", delta: 50 } })).isNew, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 50);
++    }));
++
++    it("balance overflow rolls back the grant and leaves its key retryable", () => withStore(async (store, service) => {
++      await adjust(service, 2147483647, "maximum");
++      await assert.rejects(adjust(service, 1, "overflow"), /balance exceeds/);
++      await adjust(service, -1, "make-room");
++      assert.equal((await adjust(service, 1, "overflow")).deduplicated, false);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 2147483647);
++    }));
++
++    it("response-read failure after commit can be retried without a second grant", () => withStore(async (store, service) => {
++      const read = store.getCoins.bind(store);
++      let fail = true;
++      store.getCoins = async (...args) => {
++        if (fail) { fail = false; throw new Error("response read failed"); }
++        return read(...args);
++      };
++      await assert.rejects(purchase(service), /response read failed/);
++      assert.equal((await purchase(service)).deduplicated, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 500);
++    }));
++  });
++}
++
++describe("file IAP persistence faults", () => {
++  it("does not publish an uncommitted debit while persistence is pending", async () => {
++    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "iap-file-pending-"));
++    const store = new JsonFileIapStore({ filePath: path.join(dir, "wallet.json") });
++    const service = createIapService({ store, providerRegistry });
++    let allowWrite;
++    const gate = new Promise((resolve) => { allowWrite = resolve; });
++    let writeStarted;
++    const started = new Promise((resolve) => { writeStarted = resolve; });
++    try {
++      await adjust(service, 100, "fund");
++      const snapshot = store._writeSnapshot.bind(store);
++      store._writeSnapshot = async (staged) => {
++        writeStarted();
++        await gate;
++        return snapshot(staged);
++      };
++      const first = adjust(service, -40, "spend");
++      await started;
++      assert.equal((await store.getCoins("player")).lumarush.balance, 100);
++      const duplicate = adjust(service, -40, "spend");
++      allowWrite();
++      assert.equal((await first).deduplicated, false);
++      assert.equal((await duplicate).deduplicated, true);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 60);
++    } finally {
++      allowWrite();
++      await fs.rm(dir, { recursive: true, force: true });
++    }
++  });
++  it("failed snapshot leaves disk, in-memory balance and success key unchanged; retry recovers", async () => {
++    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "iap-file-fault-"));
++    const filePath = path.join(dir, "wallet.json");
++    const store = new JsonFileIapStore({ filePath });
++    const service = createIapService({ store, providerRegistry });
++    try {
++      await adjust(service, 100, "fund");
++      const snapshot = store._writeSnapshot.bind(store);
++      store._writeSnapshot = async () => { throw new Error("disk write failed"); };
++      await assert.rejects(adjust(service, -40, "spend"), /disk write failed/);
++      assert.equal((await store.getCoins("player")).lumarush.balance, 100);
++      assert.equal((await new JsonFileIapStore({ filePath }).getCoins("player")).lumarush.balance, 100);
++      store._writeSnapshot = snapshot;
++      assert.equal((await adjust(service, -40, "spend")).deduplicated, false);
++      assert.equal((await adjust(service, -40, "spend")).deduplicated, true);
++      assert.equal((await new JsonFileIapStore({ filePath }).getCoins("player")).lumarush.balance, 60);
++    } finally { await fs.rm(dir, { recursive: true, force: true }); }
++  });
++});
+diff --git a/test/postgres-iap-atomicity.test.js b/test/postgres-iap-atomicity.test.js
+new file mode 100644
+index 0000000..c5886cc
+--- /dev/null
++++ b/test/postgres-iap-atomicity.test.js
+@@ -0,0 +1,106 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { PostgresIapStore } from "../services/iap-service/index.js";
++
++// Scripted client tests validate SQL/control flow, not real PostgreSQL locking.
++function scriptedStore(steps, { connectError } = {}) {
++  const events = [];
++  const releases = [];
++  const client = {
++    async query(sql, params) {
++      const normalized = sql.replace(/\s+/g, " ").trim();
++      events.push(normalized);
++      const step = steps.shift();
++      assert.ok(step, `unexpected SQL: ${normalized}`);
++      assert.match(normalized, step.sql);
++      step.check?.(params, normalized);
++      if (step.error) throw step.error;
++      return { rows: step.rows || [] };
++    },
++    release(error) { releases.push(error); }
++  };
++  const pool = {
++    async query() { throw new Error("pool.query used inside transaction"); },
++    async connect() { if (connectError) throw connectError; return client; }
++  };
++  return { store: new PostgresIapStore({ pool }), events, releases, steps };
++}
++const record = { profileId: "player", type: "consumable", productId: "coins" };
++const effect = { coins: { gameId: "lumarush", delta: 50 } };
++const insert = { sql: /INSERT INTO iap_transactions/, rows: [{ raw: record }] };
++const wallet = { sql: /INSERT INTO iap_coin_balances/ };
++const update = { sql: /UPDATE iap_coin_balances.*balance::bigint \+ \$3::bigint >= 0.*RETURNING balance/, rows: [{ balance: 50 }] };
++const begin = { sql: /^BEGIN$/ };
++const commit = { sql: /^COMMIT$/ };
++const rollback = { sql: /^ROLLBACK$/ };
++
++describe("Postgres IAP pinned-client transactions (mocked)", () => {
++  it("inserts dedupe and grants on one client before commit/release", async () => {
++    const fixture = scriptedStore([begin, insert, wallet, { ...update, check(params) { assert.deepEqual(params, ["player", "lumarush", 50]); } }, commit]);
++    assert.equal((await fixture.store.applyTransaction("google", "tx", record, effect)).isNew, true);
++    assert.deepEqual(fixture.releases, [undefined]);
++    assert.equal(fixture.steps.length, 0);
++  });
++
++  it("deduplicated retry reads existing record on pinned client and skips grant", async () => {
++    const fixture = scriptedStore([begin, { sql: /INSERT INTO iap_transactions/ }, { sql: /SELECT raw FROM iap_transactions/, rows: [{ raw: record }] }, commit]);
++    const result = await fixture.store.applyTransaction("google", "tx", record, effect);
++    assert.equal(result.isNew, false);
++    assert.deepEqual(result.record, record);
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++
++  it("insufficient debit rolls back its inserted success key and releases", async () => {
++    const fixture = scriptedStore([begin, insert, wallet, { ...update, rows: [] }, rollback]);
++    await assert.rejects(fixture.store.applyTransaction("internal_coin_adjust", "spend", record, { coins: { gameId: "lumarush", delta: -60 } }), /insufficient coins/);
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++
++  for (const stage of ["dedupe", "wallet", "grant", "commit"]) {
++    it(`rolls back/releases on ${stage} failure`, async () => {
++      const failure = new Error(`${stage} failure`);
++      const sequence = [begin, insert, wallet, update, commit];
++      const index = { dedupe: 1, wallet: 2, grant: 3, commit: 4 }[stage];
++      const steps = sequence.slice(0, index + 1).map((step, i) => i === index ? { ...step, error: failure } : step);
++      const fixture = scriptedStore([...steps, rollback]);
++      await assert.rejects(fixture.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++      assert.equal(fixture.steps.length, 0);
++      assert.deepEqual(fixture.releases, [undefined]);
++    });
++  }
++
++  it("preserves original error and discards client if rollback fails", async () => {
++    const failure = new Error("grant failure");
++    const rollbackFailure = new Error("connection lost during rollback");
++    const fixture = scriptedStore([begin, insert, wallet, { ...update, error: failure }, { ...rollback, error: rollbackFailure }]);
++    await assert.rejects(fixture.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++    assert.deepEqual(fixture.releases, [rollbackFailure]);
++  });
++
++  it("releases a client when BEGIN fails and handles acquisition failure", async () => {
++    const failure = new Error("begin failure");
++    const fixture = scriptedStore([{ ...begin, error: failure }]);
++    await assert.rejects(fixture.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++    assert.deepEqual(fixture.releases, [failure]);
++    const unavailable = scriptedStore([], { connectError: failure });
++    await assert.rejects(unavailable.store.applyTransaction("google", "tx", record, effect), (error) => error === failure);
++    assert.equal(unavailable.releases.length, 0);
++  });
++
++  it("rolls back dedupe when the existing subscription write fails", async () => {
++    const failure = new Error("subscription write failure");
++    const fixture = scriptedStore([begin, insert, { sql: /INSERT INTO iap_subscriptions/, error: failure }, rollback]);
++    await assert.rejects(fixture.store.applyTransaction("apple", "sub", record, { subscription: { active: true } }), (error) => error === failure);
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++
++  it("keeps the existing subscription write inside the same transaction", async () => {
++    const fixture = scriptedStore([begin, insert, { sql: /INSERT INTO iap_subscriptions/ }, commit]);
++    await fixture.store.applyTransaction("apple", "sub", record, { subscription: { active: true, status: "active" } });
++    assert.equal(fixture.steps.length, 0);
++    assert.deepEqual(fixture.releases, [undefined]);
++  });
++});
+diff --git a/test/postgres-iap-integration.test.js b/test/postgres-iap-integration.test.js
+new file mode 100644
+index 0000000..c92b384
+--- /dev/null
++++ b/test/postgres-iap-integration.test.js
+@@ -0,0 +1,68 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { createIapService, PostgresIapStore } from "../services/iap-service/index.js";
++
++// Opt-in only: never use DATABASE_URL or a remote host. Requires an existing
++// local PostgreSQL server and npm-installed pg. Creates/drops one isolated schema.
++it("real local PostgreSQL: atomic grants, failed-debit retries and concurrent spends", {
++  skip: !process.env.IAP_TEST_LOCAL_DATABASE_URL,
++  timeout: 30_000
++}, async () => {
++  const url = new URL(process.env.IAP_TEST_LOCAL_DATABASE_URL);
++  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
++  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "integration DB must be loopback");
++  assert.equal(url.search, "", "connection-string query overrides are not allowed");
++  const { default: pg } = await import("pg");
++  const schema = `iap_atomic_test_${process.pid}_${Date.now()}`;
++  const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
++  let pool;
++  let created = false;
++  try {
++    await admin.query(`CREATE SCHEMA ${schema}`);
++    created = true;
++    pool = new pg.Pool({ connectionString: url.toString(), options: `-c search_path=${schema}`, max: 8, connectionTimeoutMillis: 3000 });
++    const store = new PostgresIapStore({ pool });
++    await store.init();
++    const service = createIapService({ store, providerRegistry: {
++      async verifyPurchase({ provider, catalogEntry, payload }) {
++        return { provider, externalTransactionId: payload.transaction_id, type: "consumable", gameId: catalogEntry.gameId, coinsDelta: catalogEntry.coins };
++      }
++    } });
++    const buy = (id, profileId = "buyer") => service.verifyPurchase({ profileId, provider: "google", productId: "coins_500_lumarush", exportTarget: "android", payload: { transaction_id: id } });
++    const adjust = (delta, key) => service.adjustCoins({ profileId: "spender", gameId: "lumarush", delta, idempotencyKey: key });
++
++    // Raise after the dedupe INSERT, during the grant, using a real DB trigger.
++    await pool.query(`CREATE FUNCTION reject_grant() RETURNS trigger LANGUAGE plpgsql AS $$
++      BEGIN RAISE EXCEPTION 'injected wallet grant failure'; END $$`);
++    await pool.query(`CREATE TRIGGER reject_grant BEFORE UPDATE ON iap_coin_balances
++      FOR EACH ROW EXECUTE FUNCTION reject_grant()`);
++    await assert.rejects(buy("faulted-purchase", "faulted-buyer"), /injected wallet grant failure/);
++    assert.deepEqual(await store.getCoins("faulted-buyer"), {});
++    assert.equal((await pool.query("SELECT COUNT(*)::int AS n FROM iap_transactions")).rows[0].n, 0);
++    await pool.query("DROP TRIGGER reject_grant ON iap_coin_balances");
++    assert.equal((await buy("faulted-purchase", "faulted-buyer")).deduplicated, false);
++    assert.equal((await buy("faulted-purchase", "faulted-buyer")).deduplicated, true);
++    assert.equal((await store.getCoins("faulted-buyer")).lumarush.balance, 500);
++
++    const purchases = await Promise.all(Array.from({ length: 20 }, () => buy("same-purchase")));
++    assert.equal(purchases.filter((result) => !result.deduplicated).length, 1);
++    assert.equal((await store.getCoins("buyer")).lumarush.balance, 500);
++
++    await assert.rejects(adjust(-10, "initially-unfunded"), /insufficient coins/);
++    await adjust(100, "fund");
++    assert.equal((await adjust(-10, "initially-unfunded")).deduplicated, false);
++    assert.equal((await adjust(-10, "initially-unfunded")).deduplicated, true);
++    const spends = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => adjust(-10, `spend-${i}`)));
++    assert.equal(spends.filter((result) => result.status === "fulfilled").length, 9);
++    assert.equal(spends.filter((result) => result.status === "rejected" && /insufficient coins/.test(result.reason.message)).length, 11);
++    assert.equal((await store.getCoins("spender")).lumarush.balance, 0);
++    const failed = spends.findIndex((result) => result.status === "rejected");
++    await adjust(10, "refill");
++    assert.equal((await adjust(-10, `spend-${failed}`)).deduplicated, false);
++    assert.equal((await store.getCoins("spender")).lumarush.balance, 0);
++  } finally {
++    if (pool) await pool.end();
++    try { if (created) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
++    finally { await admin.end(); }
++  }
++});
+-- 
+2.39.3 (Apple Git-145)
+
+
+From 23890b888487c3f7e30d3e27bfd5d126677dd664 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:04:49 -0500
+Subject: [PATCH 3/6] Serialize every JSON IAP mutation through staged
+ persistence
+
+---
+ services/iap-service/README.md             |  24 ++++-
+ services/iap-service/src/store/iapStore.js |  84 ++++++++---------
+ test/iap-file-serialization.test.js        | 100 +++++++++++++++++++++
+ 3 files changed, 159 insertions(+), 49 deletions(-)
+ create mode 100644 test/iap-file-serialization.test.js
+
+diff --git a/services/iap-service/README.md b/services/iap-service/README.md
+index 9016c5a..7bca180 100644
+--- a/services/iap-service/README.md
++++ b/services/iap-service/README.md
+@@ -83,8 +83,9 @@ in-memory state. A failed snapshot write leaves the operation retryable. File
+ mode is single-instance/single-writer only; it provides no cross-process locking
+ or fsync-based power-loss durability. Legacy standalone store mutators remain
+ for existing setup/merge paths; do not compose them for purchase/wallet writes.
+-Concurrent profile merges versus wallet operations are outside this patch and
+-have not been made transactionally safe. Subscription/provider/webhook behavior
++The file-store follow-up below serializes all mutations, including the existing
++merge operation. PostgreSQL/memory profile merges versus wallet operations remain
++outside this patch and have not been made transactionally safe. Subscription/provider/webhook behavior
+ and save/merge implementations are otherwise unchanged.
+ 
+ Validation:
+@@ -103,3 +104,22 @@ Validation:
+ 
+ No database/server, credentials, or live settings are provisioned by these changes.
+ Review and merge this independent patch to main before staging or production.
++
++
++### File-store serialization follow-up
++
++All JSON file-store mutations now share one staged queue: `applyTransaction`,
++legacy `recordTransaction`, `addCoins`, `upsertSubscription` and `mergeProfiles`.
++Reads observe the previous committed snapshot while a write is pending. Failure
++leaves both live state and the prior file unchanged, and later operations can
++retry. The existing merge runs on the isolated in-memory stage, so its internal
++helper calls do not recursively enter the file queue or expose partial state.
++
++This corrects a reproducible lost update: a staged debit of 40 from 100 followed
++by an overlapping legacy credit of 10 previously published 60; it now persists
++70, including after reload. Regression tests also cover queued transaction and
++subscription writes, overlapping merges, and snapshot failures/retries for every
++legacy mutator. No merge selection/entitlement rules are changed. Memory and
++PostgreSQL merge concurrency, cross-process file locking and fsync durability
++remain outside this follow-up. Real PostgreSQL integration remains unexecuted
++and is a release gate, not a passing test.
+diff --git a/services/iap-service/src/store/iapStore.js b/services/iap-service/src/store/iapStore.js
+index 327a227..3a0c555 100644
+--- a/services/iap-service/src/store/iapStore.js
++++ b/services/iap-service/src/store/iapStore.js
+@@ -125,44 +125,21 @@ export class JsonFileIapStore extends InMemoryIapStore {
+   }
+ 
+   async applyTransaction(provider, externalTransactionId, record, effect = {}) {
+-    const operation = this._writeQueue.then(async () => {
+-      await this._ensureLoaded();
+-      const staged = new InMemoryIapStore();
+-      staged._coinBalances = new Map(this._coinBalances);
+-      staged._subscriptions = new Map(this._subscriptions);
+-      staged._transactions = new Map(this._transactions);
+-      const result = await staged.applyTransaction(provider, externalTransactionId, record, effect);
+-      if (result.isNew) {
+-        await this._writeSnapshot(staged);
+-        this._coinBalances = staged._coinBalances;
+-        this._subscriptions = staged._subscriptions;
+-        this._transactions = staged._transactions;
+-      }
+-      return result;
+-    });
+-    // A failed write must not poison retries or consume an idempotency key.
+-    this._writeQueue = operation.catch(() => {});
+-    return operation;
++    return this._mutate(
++      (staged) => staged.applyTransaction(provider, externalTransactionId, record, effect),
++      (result) => result.isNew
++    );
+   }
+ 
+   async recordTransaction(provider, externalTransactionId, record) {
+-    await this._ensureLoaded();
+-    const result = await super.recordTransaction(
+-      provider,
+-      externalTransactionId,
+-      record
++    return this._mutate(
++      (staged) => staged.recordTransaction(provider, externalTransactionId, record),
++      (result) => result.isNew
+     );
+-    if (result.isNew) {
+-      await this._enqueueWrite();
+-    }
+-    return result;
+   }
+ 
+   async addCoins(profileId, gameId, delta) {
+-    await this._ensureLoaded();
+-    const result = await super.addCoins(profileId, gameId, delta);
+-    await this._enqueueWrite();
+-    return result;
++    return this._mutate((staged) => staged.addCoins(profileId, gameId, delta));
+   }
+ 
+   async getCoins(profileId) {
+@@ -176,19 +153,38 @@ export class JsonFileIapStore extends InMemoryIapStore {
+   }
+ 
+   async upsertSubscription(profileId, subscription) {
+-    await this._ensureLoaded();
+-    const result = await super.upsertSubscription(profileId, subscription);
+-    await this._enqueueWrite();
+-    return result;
++    return this._mutate((staged) => staged.upsertSubscription(profileId, subscription));
+   }
+ 
+   async mergeProfiles(primaryProfileId, secondaryProfileId) {
+-    await this._ensureLoaded();
+-    const result = await super.mergeProfiles(primaryProfileId, secondaryProfileId);
+-    if (result.merged) {
+-      await this._enqueueWrite();
+-    }
+-    return result;
++    // Run the existing merge on the isolated in-memory stage. Its internal
++    // addCoins/upsertSubscription calls must not re-enter this file queue.
++    return this._mutate(
++      (staged) => staged.mergeProfiles(primaryProfileId, secondaryProfileId),
++      (result) => result.merged
++    );
++  }
++
++  async _mutate(mutation, shouldWrite = () => true) {
++    const operation = this._writeQueue.then(async () => {
++      await this._ensureLoaded();
++      const staged = new InMemoryIapStore();
++      staged._coinBalances = new Map(this._coinBalances);
++      staged._subscriptions = new Map(this._subscriptions);
++      staged._transactions = new Map(this._transactions);
++      const result = await mutation(staged);
++      if (shouldWrite(result)) {
++        await this._writeSnapshot(staged);
++        this._coinBalances = staged._coinBalances;
++        this._subscriptions = staged._subscriptions;
++        this._transactions = staged._transactions;
++      }
++      return result;
++    });
++    // All mutation paths stage before writing; a failure leaves committed state
++    // intact and cannot poison subsequent operations or consume success keys.
++    this._writeQueue = operation.catch(() => {});
++    return operation;
+   }
+ 
+   async _ensureLoaded() {
+@@ -209,12 +205,6 @@ export class JsonFileIapStore extends InMemoryIapStore {
+     await this._loadPromise;
+   }
+ 
+-  async _enqueueWrite() {
+-    const operation = this._writeQueue.then(() => this._writeSnapshot(this));
+-    this._writeQueue = operation.catch(() => {});
+-    await operation;
+-  }
+-
+   async _writeSnapshot(store) {
+     const serialized = JSON.stringify({
+       coin_balances: Array.from(store._coinBalances.entries()).map(([key, value]) => ({ key, value })),
+diff --git a/test/iap-file-serialization.test.js b/test/iap-file-serialization.test.js
+new file mode 100644
+index 0000000..0da1901
+--- /dev/null
++++ b/test/iap-file-serialization.test.js
+@@ -0,0 +1,100 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { JsonFileIapStore } from "../services/iap-service/index.js";
++
++async function withStore(run) {
++  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "iap-file-queue-"));
++  const filePath = path.join(dir, "wallet.json");
++  const store = new JsonFileIapStore({ filePath });
++  try { await run(store, filePath); }
++  finally { await fs.rm(dir, { recursive: true, force: true }); }
++}
++const transact = (store, id, delta) => store.applyTransaction("internal_coin_adjust", id, { profileId: "primary", type: "coin_adjust" }, { coins: { gameId: "game", delta } });
++function holdNextWrite(store) {
++  const original = store._writeSnapshot.bind(store);
++  let started, resume;
++  const entered = new Promise((resolve) => { started = resolve; });
++  const gate = new Promise((resolve) => { resume = resolve; });
++  let held = false;
++  store._writeSnapshot = async (staged) => {
++    if (!held) { held = true; started(); await gate; }
++    return original(staged);
++  };
++  return { entered, resume };
++}
++
++describe("file IAP shared mutation queue", () => {
++  it("preserves a legacy credit overlapping a staged transactional debit", () => withStore(async (store, filePath) => {
++    await transact(store, "fund", 100);
++    const gate = holdNextWrite(store);
++    const debit = transact(store, "spend", -40);
++    await gate.entered;
++    const credit = store.addCoins("primary", "game", 10);
++    assert.equal((await store.getCoins("primary")).game.balance, 100);
++    gate.resume();
++    await Promise.all([debit, credit]);
++    assert.equal((await store.getCoins("primary")).game.balance, 70);
++    assert.equal((await new JsonFileIapStore({ filePath }).getCoins("primary")).game.balance, 70);
++  }));
++
++  it("serializes legacy transaction records and subscription updates with wallet commits", () => withStore(async (store, filePath) => {
++    await transact(store, "fund", 100);
++    const gate = holdNextWrite(store);
++    const debit = transact(store, "spend", -40);
++    await gate.entered;
++    const record = store.recordTransaction("legacy", "record", { profileId: "primary" });
++    const subscription = store.upsertSubscription("primary", { active: true, expiresAt: 1_900_000_000 });
++    gate.resume();
++    await Promise.all([debit, record, subscription]);
++    const loaded = new JsonFileIapStore({ filePath });
++    assert.equal((await loaded.getCoins("primary")).game.balance, 60);
++    assert.equal((await loaded.getSubscription("primary")).active, true);
++    assert.equal((await loaded.recordTransaction("legacy", "record", { profileId: "primary" })).isNew, false);
++    assert.equal((await transact(loaded, "spend", -40)).isNew, false);
++  }));
++
++  it("queues existing merge mutation without re-entry deadlocks or lost debits", () => withStore(async (store, filePath) => {
++    await transact(store, "fund", 100);
++    await store.addCoins("secondary", "game", 20);
++    const gate = holdNextWrite(store);
++    const debit = transact(store, "spend", -40);
++    await gate.entered;
++    const merge = store.mergeProfiles("primary", "secondary");
++    gate.resume();
++    await Promise.all([debit, merge]);
++    const loaded = new JsonFileIapStore({ filePath });
++    assert.equal((await loaded.getCoins("primary")).game.balance, 80);
++    assert.equal((await loaded.getCoins("secondary")).game.balance, 0);
++  }));
++
++  for (const kind of ["record", "credit", "subscription", "merge"]) {
++    it(`failed legacy ${kind} persistence leaves state unchanged and queue retryable`, () => withStore(async (store, filePath) => {
++      await transact(store, "fund", 100);
++      await store.addCoins("secondary", "game", 20);
++      const before = await fs.readFile(filePath, "utf8");
++      const original = store._writeSnapshot.bind(store);
++      store._writeSnapshot = async () => { throw new Error("snapshot failure"); };
++      const mutate = () => {
++        if (kind === "record") return store.recordTransaction("legacy", "record", { profileId: "primary" });
++        if (kind === "credit") return store.addCoins("primary", "game", 10);
++        if (kind === "subscription") return store.upsertSubscription("primary", { active: true });
++        return store.mergeProfiles("primary", "secondary");
++      };
++      await assert.rejects(mutate(), /snapshot failure/);
++      assert.equal(await fs.readFile(filePath, "utf8"), before);
++      assert.equal((await store.getCoins("primary")).game.balance, 100);
++      assert.equal((await store.getCoins("secondary")).game.balance, 20);
++      assert.equal((await store.getSubscription("primary")).active, false);
++      store._writeSnapshot = original;
++      const result = await mutate();
++      if (kind === "record") assert.equal(result.isNew, true);
++      if (kind === "credit") assert.equal((await store.getCoins("primary")).game.balance, 110);
++      if (kind === "subscription") assert.equal((await store.getSubscription("primary")).active, true);
++      if (kind === "merge") assert.equal((await store.getCoins("primary")).game.balance, 120);
++      assert.equal((await transact(store, "next", -1)).isNew, true);
++    }));
++  }
++});
+-- 
+2.39.3 (Apple Git-145)
+
+
+From b477c66842ecaedbbe4b124ecacff8494ea5b4e3 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:04:28 -0500
+Subject: [PATCH 4/6] Use authoritative subscription time and captured
+ payments; disable unverified webhooks
+
+---
+ services/iap-service/README.md                |  79 +++++++++
+ services/iap-service/src/httpServer.js        |  40 ++---
+ services/iap-service/src/iapService.js        | 100 ++++++-----
+ .../src/providers/appleProvider.js            |  21 ++-
+ .../src/providers/googleProvider.js           |  41 +++--
+ .../src/providers/paypalProvider.js           |  98 +++++------
+ test/iap-lifecycle-http.test.js               |  81 +++++++++
+ test/iap-lifecycle.test.js                    | 165 ++++++++++++++++++
+ 8 files changed, 482 insertions(+), 143 deletions(-)
+ create mode 100644 test/iap-lifecycle-http.test.js
+ create mode 100644 test/iap-lifecycle.test.js
+
+diff --git a/services/iap-service/README.md b/services/iap-service/README.md
+index 7bca180..605f891 100644
+--- a/services/iap-service/README.md
++++ b/services/iap-service/README.md
+@@ -123,3 +123,82 @@ legacy mutator. No merge selection/entitlement rules are changed. Memory and
+ PostgreSQL merge concurrency, cross-process file locking and fsync durability
+ remain outside this follow-up. Real PostgreSQL integration remains unexecuted
+ and is a release gate, not a passing test.
++## Billing lifecycle hardening (stacked on atomic wallet writes)
++
++Verification time comes from the service clock (`Date.now` by default). Tests may
++inject `clock: () => unixSeconds` at service construction; request `now_seconds`,
++`nowSeconds` and `expires_at` cannot override provider verification time or the
++expiry returned by the Apple/Google adapters. Entitlement reads require both a
++provider-active value and a valid future expiry. At exactly the expiry second,
++`no_ads.active` becomes false without a new verification request. Historical
++active subscriptions lacking a valid expiry now fail closed and require an
++authorized provider reconciliation; they are not granted indefinite access.
++
++PayPal's Orders adapter supports only the existing single-unit consumable flow:
++a `COMPLETED` order containing one `COMPLETED` capture, with both order-unit and
++capture amounts/currencies matching the catalog. `APPROVED`, authorizations,
++pending/absent captures, partial/multiple captures and multi-unit orders are not
++accepted. The existing order-ID transaction key is retained to avoid regranting
++previously fulfilled orders under a new capture-ID namespace. Prices currently
++use the catalog's two-decimal currency representation (the shipped catalog is
++USD); other currency precision models need a separate implementation.
++
++PayPal subscriptions are deliberately unsupported by this Orders adapter. A
++client-provided expiry is never authoritative. Proper support requires the
++Subscriptions API, a server-owned product/plan/account association and verified
++billing-period/payment data; no duration is invented from a completed order.
++Apple verification requires a matching receipt product and valid subscription
++expiry, selecting the newest matching receipt line. Google checks the matching
++subscription line, valid expiry and provider state: active, grace-period and
++canceled-but-unexpired states may retain access; pending/paused/on-hold states do
++not. Neither provider accepts client clock/expiry as entitlement authority.
++Malformed HTTP request/payload shapes return 400; provider verification rejection
++returns 422. Storage/server failures remain 500 and must not be classified as a
++successful purchase.
++
++### Webhooks are disabled, not fully integrated
++
++All three webhook endpoints return 503 `webhook_not_configured` for valid JSON.
++Malformed JSON/shapes return 400. The prior allow-all signature stub and broken
++arrow-`this` purchase dispatch are removed. Neither signature-looking headers,
++client profile/product fields, nor a native-looking provider envelope enables
++processing. No signature verification is claimed by this implementation.
++
++Before enabling events, implement and review native verification plus durable,
++server-owned account/product association, replay/out-of-order handling and
++reconciliation:
++
++- Apple: verified signed App Store Server Notifications and app/environment
++  binding, with transaction/subscription association to a platform account.
++- Google: authenticated Pub/Sub push with the expected identity/audience,
++  notification decoding and an authoritative Play Developer API lookup with
++  package/product/account binding.
++- PayPal: native webhook verification for the configured webhook identity and
++  transmission data, followed by trusted merchant/order/subscription/account
++  mapping. The legacy profile_id/product_id wrapper is not a native provider
++  event contract and must not be trusted.
++
++Renewals, refunds, revocations, missed-event replay and reconciliation are not
++implemented here. Existing same-transaction deduplication does not update a
++subscription on a later state change with the same transaction ID. Expiry checks
++alone do not handle early revocation. Do not enable or expand live payments on
++the basis of these mocks. Review app/package, merchant, product and account
++binding and existing grants before rollout. Apple's legacy verifyReceipt API
++remains in use and is deprecated; migration is a separate integration task.
++
++Official contract references:
++
++- PayPal Orders/captures: https://developer.paypal.com/api/orders/v2
++- PayPal Subscriptions: https://developer.paypal.com/api/subscriptions/v1
++- PayPal webhook verification: https://developer.paypal.com/api/webhooks/v1/
++- Apple receipt API: https://developer.apple.com/documentation/appstorereceipts/verify-receipt
++- Apple notifications: https://developer.apple.com/documentation/appstoreservernotifications/receiving-app-store-server-notifications
++- Google subscription resource/states: https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptionsv2
++- Google authenticated push: https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions
++
++Validation uses provider HTTP/OAuth test doubles and local HTTP routes. It does
++not exercise live provider verification or real webhook signatures. The real
++PostgreSQL integration test remains unexecuted and is a release gate. No new
++credentials, secrets, provider settings, deployments or system services are
++created/configured. Publication waits for authorized GitHub authentication;
++reviewed main commits must precede staging, then production.
+diff --git a/services/iap-service/src/httpServer.js b/services/iap-service/src/httpServer.js
+index 32ea1d6..2a6eec1 100644
+--- a/services/iap-service/src/httpServer.js
++++ b/services/iap-service/src/httpServer.js
+@@ -1,5 +1,6 @@
+ import http from "node:http";
+ import crypto from "node:crypto";
++import { PurchaseVerificationError, WebhookUnavailableError } from "./iapService.js";
+ import {
+   JwtValidationError,
+   createSessionTokenVerifier
+@@ -66,6 +67,12 @@ export function createIapHttpServer(options = {}) {
+         requestId
+       });
+     } catch (error) {
++      if (error instanceof PurchaseVerificationError) {
++        error = new HttpError(422, "purchase_rejected", error.message);
++      }
++      if (error instanceof WebhookUnavailableError) {
++        error = new HttpError(503, "webhook_not_configured", error.message);
++      }
+       if (error instanceof HttpError) {
+         writeJson(res, error.statusCode, {
+           request_id: requestId,
+@@ -128,6 +135,11 @@ async function handleRequest(req, res, ctx) {
+     }
+     const body = await readJsonBody(req, ctx.bodyLimitBytes);
+     ensureObjectBody(body);
++    if (typeof body.provider !== "string" || !body.provider.trim() ||
++        typeof body.product_id !== "string" || !body.product_id.trim()) {
++      throw new HttpError(400, "invalid_request", "provider and product_id are required");
++    }
++    ensureObjectBody(body.payload);
+     const result = await ctx.service.verifyPurchase({
+       profileId,
+       provider: body.provider,
+@@ -168,18 +180,8 @@ async function handleRequest(req, res, ctx) {
+   if (req.method === "POST" && isWebhookPath(url.pathname)) {
+     const body = await readJsonBody(req, ctx.bodyLimitBytes);
+     ensureObjectBody(body);
+-  const provider = webhookProviderFromPath(url.pathname);
+-    await verifyWebhookSignatureStub(req, provider);
+-    const result = await ctx.service.applyWebhookEvent({
+-      provider,
+-      body: {
+-        ...body,
+-        export_target:
+-          body.export_target ||
+-          req.headers["x-export-target"] ||
+-          mapProviderToDefaultTarget(provider)
+-      }
+-    });
++    const provider = webhookProviderFromPath(url.pathname);
++    const result = await ctx.service.applyWebhookEvent({ provider, body });
+     writeJson(res, 202, {
+       request_id: ctx.requestId,
+       ...result
+@@ -286,20 +288,6 @@ function webhookProviderFromPath(pathname) {
+   return "paypal_web";
+ }
+ 
+-function mapProviderToDefaultTarget(provider) {
+-  if (provider === "apple") {
+-    return "ios";
+-  }
+-  if (provider === "google") {
+-    return "android";
+-  }
+-  return "web";
+-}
+-
+-async function verifyWebhookSignatureStub(_req, _provider) {
+-  return true;
+-}
+-
+ async function readJsonBody(req, bodyLimitBytes) {
+   const chunks = [];
+   let total = 0;
+diff --git a/services/iap-service/src/iapService.js b/services/iap-service/src/iapService.js
+index fb49cb0..66facb6 100644
+--- a/services/iap-service/src/iapService.js
++++ b/services/iap-service/src/iapService.js
+@@ -6,6 +6,13 @@ import { createNoopIapRuntimeConfigProvider } from "./runtimeConfigProvider.js";
+ 
+ export function createIapService(options = {}) {
+   const store = options.store || new InMemoryIapStore();
++  // Tests may inject server time at construction; requests never supply it.
++  const clock = options.clock || (() => Math.floor(Date.now() / 1000));
++  const now = () => {
++    const value = clock();
++    if (!Number.isFinite(value) || value <= 0) throw new Error("invalid server clock");
++    return Math.floor(value);
++  };
+   const baseCatalog = createCatalog(options.catalog || {});
+   const providers =
+     options.providerRegistry || createProviderRegistry(options.providers || {});
+@@ -18,7 +25,7 @@ export function createIapService(options = {}) {
+     ]);
+     return {
+       profile_id: profileId,
+-      no_ads: normalizeSubscription(noAds),
++      no_ads: normalizeSubscription(noAds, now()),
+       coins
+     };
+   };
+@@ -49,17 +56,23 @@ export function createIapService(options = {}) {
+       const runtimeCatalog = normalizeObject(runtimeConfig?.iapCatalog);
+       const catalog = mergeCatalog(baseCatalog, runtimeCatalog);
+       const iapProviderConfigs = normalizeObject(runtimeConfig?.iapProviderConfigs);
+-      const normalized = await normalizePurchase({
+-        profileId,
+-        provider,
+-        productId,
+-        payload,
+-        catalog,
+-        exportTarget,
+-        providers,
+-        gameId: normalizedGameId,
+-        iapProviderConfigs
+-      });
++      let normalized;
++      try {
++        normalized = await normalizePurchase({
++          profileId,
++          provider,
++          productId,
++          payload,
++          catalog,
++          exportTarget,
++          providers,
++          gameId: normalizedGameId,
++          iapProviderConfigs,
++          nowSeconds: now()
++        });
++      } catch (error) {
++        throw new PurchaseVerificationError(error.message);
++      }
+       const dedupe = await store.applyTransaction(
+         normalized.provider,
+         normalized.externalTransactionId,
+@@ -91,22 +104,12 @@ export function createIapService(options = {}) {
+         entitlements
+       };
+     },
+-    applyWebhookEvent: async ({ provider, body }) => {
+-      const normalizedBody = body && typeof body === "object" ? body : {};
+-      const profileId = String(normalizedBody.profile_id || "").trim();
+-      const productId = String(normalizedBody.product_id || "").trim();
+-      const exportTarget = String(normalizedBody.export_target || "").trim();
+-      if (!profileId || !productId) {
+-        throw new Error("webhook payload requires profile_id and product_id");
+-      }
+-      return this.verifyPurchase({
+-        profileId,
+-        provider,
+-        productId,
+-        exportTarget,
+-        gameId: normalizedBody.game_id || "",
+-        payload: normalizedBody.payload || normalizedBody
+-      });
++    applyWebhookEvent: async ({ provider }) => {
++      normalizeProvider(provider);
++      // Native provider notifications require authenticated envelopes and a
++      // server-owned account/product mapping. No verified adapter exists yet.
++      // Reject explicitly instead of calling an arrow function's lexical `this`.
++      throw new WebhookUnavailableError();
+     },
+     mergeProfiles: async ({ primaryProfileId, secondaryProfileId }) => {
+       assertRequiredString(primaryProfileId, "primaryProfileId");
+@@ -181,13 +184,16 @@ async function normalizePurchase(input) {
+   }
+   const target = normalizeExportTarget(input.exportTarget || input.payload?.export_target);
+   enforceProviderForTarget(provider, target);
+-  const payload = input.payload && typeof input.payload === "object" ? input.payload : {};
++  if (!input.payload || typeof input.payload !== "object" || Array.isArray(input.payload)) {
++    throw new Error("payload must be an object");
++  }
++  const payload = input.payload;
+   const verified = await input.providers.verifyPurchase({
+     provider,
+     productId,
+     payload,
+     catalogEntry,
+-    nowSeconds: payload.now_seconds,
++    nowSeconds: input.nowSeconds,
+     providerConfig: resolveProviderConfig(input.iapProviderConfigs, provider),
+     gameId: expectedGameId
+   });
+@@ -267,23 +273,37 @@ function normalizeObject(value) {
+   return value;
+ }
+ 
+-function normalizeSubscription(sub) {
+-  const active = Boolean(sub?.active);
+-  const status = String(sub?.status || (active ? "active" : "none"));
++function normalizeSubscription(sub, nowSeconds) {
+   const expires = Number(sub?.expiresAt);
+-  if (Number.isFinite(expires) && expires > 0) {
+-    return {
+-      active,
+-      status,
+-      expires_at: Math.floor(expires)
+-    };
++  const validExpiry = Number.isFinite(expires) && expires > 0;
++  const active = sub?.active === true && validExpiry && expires > nowSeconds;
++  let status = String(sub?.status || (sub?.active === true ? "active" : "none"));
++  if (validExpiry && expires <= nowSeconds && (sub?.active === true || status === "active")) {
++    status = "expired";
++  } else if (!validExpiry && sub?.active === true) {
++    status = "invalid_expiry";
+   }
+   return {
+     active,
+-    status
++    status,
++    ...(validExpiry ? { expires_at: Math.floor(expires) } : {})
+   };
+ }
+ 
++export class PurchaseVerificationError extends Error {
++  constructor(message) {
++    super(message);
++    this.name = "PurchaseVerificationError";
++  }
++}
++
++export class WebhookUnavailableError extends Error {
++  constructor() {
++    super("Verified provider webhook processing is not configured");
++    this.name = "WebhookUnavailableError";
++  }
++}
++
+ function normalizeProvider(provider) {
+   const normalized = String(provider || "").trim().toLowerCase();
+   if (!normalized) {
+diff --git a/services/iap-service/src/providers/appleProvider.js b/services/iap-service/src/providers/appleProvider.js
+index f16c307..31f240f 100644
+--- a/services/iap-service/src/providers/appleProvider.js
++++ b/services/iap-service/src/providers/appleProvider.js
+@@ -1,4 +1,5 @@
+ export function createAppleProvider(options = {}) {
++  const fetchImpl = options.fetch || fetch;
+   const sharedSecret = String(options.sharedSecret || "");
+   const productionUrl =
+     String(options.productionUrl || "").trim() ||
+@@ -9,7 +10,8 @@ export function createAppleProvider(options = {}) {
+ 
+   return {
+     verifyPurchase: async ({ provider, productId, payload, catalogEntry, nowSeconds }) => {
+-      const receiptData = String(payload?.receipt_data || payload?.receiptData || "").trim();
++      const rawReceipt = payload?.receipt_data || payload?.receiptData;
++      const receiptData = typeof rawReceipt === "string" ? rawReceipt.trim() : "";
+       if (!receiptData) {
+         throw new Error("apple payload.receipt_data is required");
+       }
+@@ -18,10 +20,10 @@ export function createAppleProvider(options = {}) {
+         password: sharedSecret || undefined,
+         "exclude-old-transactions": true
+       };
+-      let response = await postJson(productionUrl, requestBody);
++      let response = await postJson(productionUrl, requestBody, fetchImpl);
+       // Apple status 21007 means sandbox receipt sent to production.
+       if (Number(response?.status) === 21007) {
+-        response = await postJson(sandboxUrl, requestBody);
++        response = await postJson(sandboxUrl, requestBody, fetchImpl);
+       }
+       if (Number(response?.status) !== 0) {
+         throw new Error(`apple receipt rejected (status=${response?.status})`);
+@@ -48,6 +50,9 @@ export function createAppleProvider(options = {}) {
+         };
+       }
+       const expiresAt = Math.floor(Number(line.expires_date_ms || 0) / 1000);
++      if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
++        throw new Error("apple subscription missing valid expiry");
++      }
+       const active = expiresAt > now;
+       return {
+         provider,
+@@ -74,6 +79,10 @@ function pickAppleReceiptLine(response, productId) {
+   const inApp = Array.isArray(response?.receipt?.in_app) ? response.receipt.in_app : [];
+   const merged = [...latest, ...inApp];
+   const target = String(productId || "").trim().toLowerCase();
++  merged.sort((a, b) =>
++    Number(b?.expires_date_ms || b?.purchase_date_ms || 0) -
++    Number(a?.expires_date_ms || a?.purchase_date_ms || 0)
++  );
+   for (const row of merged) {
+     if (!row || typeof row !== "object") {
+       continue;
+@@ -82,11 +91,11 @@ function pickAppleReceiptLine(response, productId) {
+       return row;
+     }
+   }
+-  return merged[0] || null;
++  return null;
+ }
+ 
+-async function postJson(url, body) {
+-  const response = await fetch(url, {
++async function postJson(url, body, fetchImpl) {
++  const response = await fetchImpl(url, {
+     method: "POST",
+     headers: {
+       "content-type": "application/json"
+diff --git a/services/iap-service/src/providers/googleProvider.js b/services/iap-service/src/providers/googleProvider.js
+index 06b1fa4..713dd93 100644
+--- a/services/iap-service/src/providers/googleProvider.js
++++ b/services/iap-service/src/providers/googleProvider.js
+@@ -1,6 +1,7 @@
+ import crypto from "node:crypto";
+ 
+ export function createGooglePlayProvider(options = {}) {
++  const fetchImpl = options.fetch || fetch;
+   const clientEmail = String(options.clientEmail || "");
+   const privateKey = normalizePrivateKey(options.privateKey || "");
+   const tokenUrl =
+@@ -12,10 +13,10 @@ export function createGooglePlayProvider(options = {}) {
+ 
+   return {
+     verifyPurchase: async ({ provider, productId, payload, catalogEntry, nowSeconds }) => {
+-      const packageName = String(payload?.package_name || payload?.packageName || "").trim();
+-      const purchaseToken = String(
+-        payload?.purchase_token || payload?.purchaseToken || ""
+-      ).trim();
++      const rawPackage = payload?.package_name || payload?.packageName;
++      const rawToken = payload?.purchase_token || payload?.purchaseToken;
++      const packageName = typeof rawPackage === "string" ? rawPackage.trim() : "";
++      const purchaseToken = typeof rawToken === "string" ? rawToken.trim() : "";
+       if (!packageName || !purchaseToken) {
+         throw new Error("google payload.package_name and payload.purchase_token are required");
+       }
+@@ -26,7 +27,8 @@ export function createGooglePlayProvider(options = {}) {
+         clientEmail,
+         privateKey,
+         tokenUrl,
+-        scope
++        scope,
++        fetchImpl
+       });
+ 
+       if (catalogEntry.type === "consumable") {
+@@ -35,8 +37,8 @@ export function createGooglePlayProvider(options = {}) {
+         )}/purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(
+           purchaseToken
+         )}`;
+-        const purchase = await getJson(url, accessToken);
+-        const state = Number(purchase.purchaseState || 0);
++        const purchase = await getJson(url, accessToken, fetchImpl);
++        const state = purchase.purchaseState;
+         if (state !== 0) {
+           throw new Error(`google purchase not completed (purchaseState=${state})`);
+         }
+@@ -55,12 +57,23 @@ export function createGooglePlayProvider(options = {}) {
+       const url = `${apiBase}/${encodeURIComponent(
+         packageName
+       )}/purchases/subscriptionsv2/tokens/${encodeURIComponent(purchaseToken)}`;
+-      const sub = await getJson(url, accessToken);
+-      const latestLine = Array.isArray(sub.lineItems) ? sub.lineItems[0] || {} : {};
++      const sub = await getJson(url, accessToken, fetchImpl);
++      const lines = Array.isArray(sub.lineItems)
++        ? sub.lineItems.filter((line) => line?.productId === productId)
++        : [];
++      lines.sort((a, b) => Date.parse(b.expiryTime) - Date.parse(a.expiryTime));
++      const latestLine = lines[0];
++      if (!latestLine) throw new Error("google subscription missing matching product");
+       const expiry = Date.parse(String(latestLine.expiryTime || ""));
+       const expiresAt = Number.isFinite(expiry) ? Math.floor(expiry / 1000) : 0;
++      if (expiresAt <= 0) throw new Error("google subscription missing valid expiry");
+       const now = normalizeNow(nowSeconds);
+-      const active = expiresAt > now;
++      const state = String(sub.subscriptionState || "");
++      if (!state || state === "SUBSCRIPTION_STATE_UNSPECIFIED") {
++        throw new Error("google subscription missing state");
++      }
++      const entitledStates = ["SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD", "SUBSCRIPTION_STATE_CANCELED"];
++      const active = entitledStates.includes(state) && expiresAt > now;
+       return {
+         provider,
+         externalTransactionId: String(
+@@ -72,7 +85,7 @@ export function createGooglePlayProvider(options = {}) {
+         subscription: {
+           provider,
+           externalSubscriptionId: String(sub.latestOrderId || purchaseToken),
+-          status: active ? "active" : "expired",
++          status: expiresAt <= now ? "expired" : state.replace("SUBSCRIPTION_STATE_", "").toLowerCase(),
+           active,
+           expiresAt: expiresAt > 0 ? expiresAt : undefined
+         }
+@@ -94,7 +107,7 @@ async function createGoogleAccessToken(config) {
+     grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+     assertion
+   });
+-  const response = await fetch(config.tokenUrl, {
++  const response = await config.fetchImpl(config.tokenUrl, {
+     method: "POST",
+     headers: {
+       "content-type": "application/x-www-form-urlencoded"
+@@ -129,8 +142,8 @@ function signServiceAccountJwt(input) {
+   return `${unsigned}.${base64UrlBuffer(signature)}`;
+ }
+ 
+-async function getJson(url, accessToken) {
+-  const response = await fetch(url, {
++async function getJson(url, accessToken, fetchImpl) {
++  const response = await fetchImpl(url, {
+     method: "GET",
+     headers: {
+       authorization: `Bearer ${accessToken}`
+diff --git a/services/iap-service/src/providers/paypalProvider.js b/services/iap-service/src/providers/paypalProvider.js
+index 30063c6..ddb65d1 100644
+--- a/services/iap-service/src/providers/paypalProvider.js
++++ b/services/iap-service/src/providers/paypalProvider.js
+@@ -1,12 +1,17 @@
+ export function createPaypalWebProvider(options = {}) {
++  const fetchImpl = options.fetch || fetch;
+   const defaultClientId = String(options.clientId || "");
+   const defaultClientSecret = String(options.clientSecret || "");
+   const defaultBaseUrl =
+     String(options.baseUrl || "").trim() || "https://api-m.paypal.com";
+ 
+   return {
+-    verifyPurchase: async ({ provider, payload, catalogEntry, nowSeconds, providerConfig }) => {
+-      const orderId = String(payload?.order_id || payload?.orderId || "").trim();
++    verifyPurchase: async ({ provider, payload, catalogEntry, providerConfig }) => {
++      if (catalogEntry?.type !== "consumable") {
++        throw new Error("PayPal subscription verification is not supported");
++      }
++      const rawOrderId = payload?.order_id || payload?.orderId;
++      const orderId = typeof rawOrderId === "string" ? rawOrderId.trim() : "";
+       if (!orderId) {
+         throw new Error("paypal payload.order_id is required");
+       }
+@@ -23,76 +28,62 @@ export function createPaypalWebProvider(options = {}) {
+       const token = await getPaypalAccessToken(
+         `${effectiveBaseUrl}/v1/oauth2/token`,
+         effectiveClientId,
+-        effectiveClientSecret
++        effectiveClientSecret,
++        fetchImpl
+       );
+       const order = await getJson(
+         `${effectiveBaseUrl}/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+-        token
++        token,
++        fetchImpl
+       );
+       const status = String(order?.status || "").toUpperCase();
+-      if (!["COMPLETED", "APPROVED"].includes(status)) {
++      if (status !== "COMPLETED") {
+         throw new Error(`paypal order not complete (status=${status || "unknown"})`);
+       }
++      if (order.id !== orderId) throw new Error("paypal order ID mismatch");
+       assertOrderMatchesCatalog(order, catalogEntry);
+ 
+-      if (catalogEntry.type === "consumable") {
+-        return {
+-          provider,
+-          externalTransactionId: orderId,
+-          type: "consumable",
+-          gameId: catalogEntry.gameId,
+-          coinsDelta: Number(catalogEntry.coins) || 0,
+-          subscription: null
+-        };
+-      }
+-      const expiresAt = Number(payload?.expires_at || 0);
+-      const now = normalizeNow(nowSeconds);
+-      const active = Number.isFinite(expiresAt) ? expiresAt > now : true;
+       return {
+         provider,
+         externalTransactionId: orderId,
+-        type: "subscription",
+-        gameId: "",
+-        coinsDelta: 0,
+-        subscription: {
+-          provider,
+-          externalSubscriptionId: orderId,
+-          status: active ? "active" : "expired",
+-          active,
+-          expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? Math.floor(expiresAt) : undefined
+-        }
++        type: "consumable",
++        gameId: catalogEntry.gameId,
++        coinsDelta: Number(catalogEntry.coins) || 0,
++        subscription: null
+       };
+     }
+   };
+ }
+ 
+ function assertOrderMatchesCatalog(order, catalogEntry) {
+-  const expectedPrice = Number(catalogEntry?.price || 0);
+-  const expectedCurrency = String(catalogEntry?.currency || "").trim().toUpperCase();
+-  const unit = order?.purchase_units?.[0] || {};
+-  const amount = unit?.amount || {};
+-  const orderValue = Number(amount?.value || 0);
+-  const orderCurrency = String(amount?.currency_code || "").trim().toUpperCase();
+-
+-  if (expectedCurrency && orderCurrency && expectedCurrency !== orderCurrency) {
+-    throw new Error(
+-      `paypal currency mismatch (expected=${expectedCurrency}, actual=${orderCurrency})`
+-    );
++  const units = order.purchase_units;
++  if (!Array.isArray(units) || units.length !== 1) {
++    throw new Error("paypal requires one fully captured purchase unit");
+   }
++  const captures = units[0]?.payments?.captures;
++  if (!Array.isArray(captures) || captures.length !== 1 ||
++      !captures[0]?.id || captures[0].status !== "COMPLETED") {
++    throw new Error("paypal completed capture is required");
++  }
++  assertAmount(units[0].amount, catalogEntry);
++  assertAmount(captures[0].amount, catalogEntry);
++}
+ 
+-  if (expectedPrice > 0 && Number.isFinite(orderValue)) {
+-    const delta = Math.abs(expectedPrice - orderValue);
+-    if (delta > 0.01) {
+-      throw new Error(
+-        `paypal amount mismatch (expected=${expectedPrice.toFixed(2)}, actual=${orderValue.toFixed(2)})`
+-      );
+-    }
++function assertAmount(amount, catalogEntry) {
++  const expected = Number(catalogEntry.price);
++  const currency = String(catalogEntry.currency || "").trim().toUpperCase();
++  const value = amount?.value;
++  if (!Number.isFinite(expected) || expected <= 0 || !currency ||
++      typeof value !== "string" || !/^\d+(?:\.\d{1,2})?$/.test(value) ||
++      amount.currency_code !== currency ||
++      Math.round(Number(value) * 100) !== Math.round(expected * 100)) {
++    throw new Error("paypal captured amount/currency does not match catalog");
+   }
+ }
+ 
+-async function getPaypalAccessToken(tokenUrl, clientId, clientSecret) {
++async function getPaypalAccessToken(tokenUrl, clientId, clientSecret, fetchImpl) {
+   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+-  const response = await fetch(tokenUrl, {
++  const response = await fetchImpl(tokenUrl, {
+     method: "POST",
+     headers: {
+       authorization: `Basic ${basic}`,
+@@ -107,8 +98,8 @@ async function getPaypalAccessToken(tokenUrl, clientId, clientSecret) {
+   return String(json.access_token);
+ }
+ 
+-async function getJson(url, accessToken) {
+-  const response = await fetch(url, {
++async function getJson(url, accessToken, fetchImpl) {
++  const response = await fetchImpl(url, {
+     method: "GET",
+     headers: {
+       authorization: `Bearer ${accessToken}`
+@@ -120,10 +111,3 @@ async function getJson(url, accessToken) {
+   }
+   return json;
+ }
+-
+-function normalizeNow(nowSeconds) {
+-  if (Number.isFinite(Number(nowSeconds)) && Number(nowSeconds) > 0) {
+-    return Math.floor(Number(nowSeconds));
+-  }
+-  return Math.floor(Date.now() / 1000);
+-}
+diff --git a/test/iap-lifecycle-http.test.js b/test/iap-lifecycle-http.test.js
+new file mode 100644
+index 0000000..98c53ac
+--- /dev/null
++++ b/test/iap-lifecycle-http.test.js
+@@ -0,0 +1,81 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { createIapService, createIapHttpServer } from "../services/iap-service/index.js";
++import { createSessionToken } from "../packages/shared-utils/index.js";
++const now = 1_800_000_000;
++async function withServer(run) {
++  let clock = now;
++  let orderStatus = "APPROVED";
++  const secret = "test-iap-http-session-secret";
++  const service = createIapService({ clock: () => clock, providers: {
++    apple: { fetch: async () => new Response(JSON.stringify({ status: 0, latest_receipt_info: [{ product_id: "no_ads_monthly", transaction_id: "receipt-tx", expires_date_ms: String((now + 1) * 1000) }] })) },
++    paypal: { clientId: "test-client", clientSecret: "test-secret", fetch: async (url) => new Response(JSON.stringify(url.endsWith("/token") ? { access_token: "test-token" } : {
++      id: "ORDER-1", status: orderStatus, purchase_units: [{ amount: { value: "0.99", currency_code: "USD" }, payments: { captures: [{ id: "CAPTURE-1", status: "COMPLETED", amount: { value: "0.99", currency_code: "USD" } }] } }]
++    })) }
++  } });
++  const server = createIapHttpServer({ service, sessionSecret: secret });
++  const { baseUrl } = await server.listen();
++  const token = createSessionToken({ sub: "player" }, secret, { ttlSeconds: 600 });
++  const headers = { "content-type": "application/json", authorization: `Bearer ${token}` };
++  const post = (path, body, extra = {}) => fetch(`${baseUrl}${path}`, { method: "POST", headers: { ...headers, ...extra }, body: JSON.stringify(body) });
++  try { await run({ baseUrl, service, post, headers, advance: () => clock++, capture: () => { orderStatus = "COMPLETED"; } }); }
++  finally { await server.close(); }
++}
++describe("IAP lifecycle routes", () => {
++  it("uses server expiry on verification/read despite request time and expiry fields", () => withServer(async ({ baseUrl, post, headers, advance }) => {
++    const request = { provider: "apple", product_id: "no_ads_monthly", export_target: "ios", nowSeconds: 1, payload: { receipt_data: "test-receipt", now_seconds: 1, expires_at: now + 999999 } };
++    const response = await post("/v1/iap/verify", request);
++    assert.equal(response.status, 200);
++    assert.equal((await response.json()).entitlements.no_ads.active, true);
++    advance();
++    const read = await fetch(`${baseUrl}/v1/iap/entitlements?now_seconds=1`, { headers });
++    assert.equal(read.status, 200);
++    assert.equal((await read.json()).no_ads.active, false);
++    const retry = await post("/v1/iap/verify", request);
++    assert.equal(retry.status, 200);
++    const result = await retry.json();
++    assert.equal(result.deduplicated, true);
++    assert.equal(result.entitlements.no_ads.active, false);
++  }));
++  it("rejects approved-but-uncaptured PayPal without consuming the order key", () => withServer(async ({ post, capture, service }) => {
++    const request = { provider: "paypal_web", product_id: "coins_500_lumarush", export_target: "web", payload: { order_id: "ORDER-1" } };
++    const denied = await post("/v1/iap/verify", request);
++    assert.equal(denied.status, 422);
++    assert.equal((await denied.json()).error.code, "purchase_rejected");
++    assert.equal(service.store._transactions.size, 0);
++    capture();
++    const granted = await post("/v1/iap/verify", request);
++    assert.equal(granted.status, 200);
++    const result = await granted.json();
++    assert.equal(result.deduplicated, false);
++    assert.equal(result.entitlements.coins.lumarush.balance, 500);
++  }));
++  it("rejects client-supplied PayPal subscription expiry", () => withServer(async ({ post, service }) => {
++    const response = await post("/v1/iap/verify", { provider: "paypal_web", product_id: "no_ads_monthly", payload: { order_id: "ORDER-1", expires_at: now + 999999 } });
++    assert.equal(response.status, 422);
++    assert.equal(service.store._transactions.size, 0);
++  }));
++  it("fails closed for unsigned, signature-looking and native-envelope webhook bodies", () => withServer(async ({ post, service }) => {
++    for (const provider of ["apple", "google", "paypal"]) {
++      for (const body of [
++        { profile_id: "victim", product_id: "coins_500_lumarush", payload: { transaction_id: "forged" } },
++        { signedPayload: "not-a-valid-jws", message: { data: "not-a-valid-pubsub-payload" }, event_type: "PAYMENT.CAPTURE.COMPLETED" }
++      ]) {
++        const response = await post(`/v1/iap/webhook/${provider}`, body, { "paypal-transmission-sig": "invalid-signature", authorization: "Bearer invalid-push-jwt" });
++        assert.equal(response.status, 503);
++        assert.equal((await response.json()).error.code, "webhook_not_configured");
++      }
++    }
++    assert.equal(service.store._transactions.size, 0);
++    const { applyWebhookEvent } = service;
++    await assert.rejects(applyWebhookEvent({ provider: "apple", body: {} }), { name: "WebhookUnavailableError" });
++  }));
++  it("rejects malformed JSON/request/payload objects without grants", () => withServer(async ({ post, baseUrl, headers, service }) => {
++    for (const body of [null, [], {}, { provider: 42, product_id: "no_ads_monthly", payload: {} }, { provider: "apple", product_id: "no_ads_monthly", payload: [] }]) {
++      assert.equal((await post("/v1/iap/verify", body)).status, 400);
++    }
++    assert.equal((await fetch(`${baseUrl}/v1/iap/webhook/apple`, { method: "POST", headers, body: "{" })).status, 400);
++    assert.equal((await post("/v1/iap/webhook/google", [])).status, 400);
++    assert.equal(service.store._transactions.size, 0);
++  }));
++});
+diff --git a/test/iap-lifecycle.test.js b/test/iap-lifecycle.test.js
+new file mode 100644
+index 0000000..64ee808
+--- /dev/null
++++ b/test/iap-lifecycle.test.js
+@@ -0,0 +1,165 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import { createIapService, InMemoryIapStore } from "../services/iap-service/index.js";
++import { createAppleProvider } from "../services/iap-service/src/providers/appleProvider.js";
++import { createGooglePlayProvider } from "../services/iap-service/src/providers/googleProvider.js";
++import { createPaypalWebProvider } from "../services/iap-service/src/providers/paypalProvider.js";
++
++const now = 1_800_000_000;
++const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
++const subRequest = { profileId: "player", provider: "apple", productId: "no_ads_monthly", exportTarget: "ios", payload: { receipt_data: "test-receipt", now_seconds: 1, expires_at: 9_000_000_000 } };
++function appleService(reply, clock = () => now) {
++  return createIapService({ clock, providers: { apple: { fetch: async () => json(reply) } } });
++}
++const receipt = (expires, product = "no_ads_monthly", id = "apple-tx") => ({ status: 0, latest_receipt_info: [{ product_id: product, transaction_id: id, original_transaction_id: "apple-sub", expires_date_ms: String(expires * 1000) }] });
++
++function paypalService(order, onFetch = () => {}) {
++  return createIapService({ clock: () => now, providers: { paypal: {
++    clientId: "test-client", clientSecret: "test-client-secret",
++    fetch: async (url) => {
++      onFetch(url);
++      return url.endsWith("/token") ? json({ access_token: "test-access-token" }) : json(order);
++    }
++  } } });
++}
++const paypalRequest = { profileId: "player", provider: "paypal_web", productId: "coins_500_lumarush", exportTarget: "web", payload: { order_id: "ORDER-1" } };
++const completedOrder = () => ({ id: "ORDER-1", status: "COMPLETED", purchase_units: [{ amount: { value: "0.99", currency_code: "USD" }, payments: { captures: [{ id: "CAPTURE-1", status: "COMPLETED", amount: { value: "0.99", currency_code: "USD" } }] } }] });
++
++describe("server-time subscription lifecycle", () => {
++  for (const [offset, active] of [[1, true], [0, false], [-1, false]]) {
++    it(`Apple receipt at expiry offset ${offset} ignores client clock/expiry`, async () => {
++      const service = appleService(receipt(now + offset));
++      const result = await service.verifyPurchase({ ...subRequest, nowSeconds: 1 });
++      assert.equal(result.entitlements.no_ads.active, active);
++      assert.equal(result.entitlements.no_ads.expires_at, now + offset);
++    });
++  }
++
++  it("rechecks expiry on reads and on a deduplicated verification", async () => {
++    let clock = now;
++    const service = appleService(receipt(now + 5), () => clock);
++    assert.equal((await service.verifyPurchase(subRequest)).entitlements.no_ads.active, true);
++    clock += 5;
++    assert.deepEqual((await service.getEntitlements({ profileId: "player", nowSeconds: 1 })).no_ads, { active: false, status: "expired", expires_at: now + 5 });
++    const retry = await service.verifyPurchase(subRequest);
++    assert.equal(retry.deduplicated, true);
++    assert.equal(retry.entitlements.no_ads.active, false);
++  });
++
++  it("uses latest matching Apple line and never falls back to another product", async () => {
++    const reply = receipt(now - 10);
++    reply.latest_receipt_info.push(receipt(now + 100, "no_ads_monthly", "renewed-tx").latest_receipt_info[0]);
++    assert.equal((await appleService(reply).verifyPurchase(subRequest)).entitlements.no_ads.active, true);
++    await assert.rejects(appleService(receipt(now + 100, "different-product")).verifyPurchase(subRequest), /matching product/);
++  });
++
++  it("rejects malformed verified expiry and receipt payload before entitlement grant", async () => {
++    const service = appleService(receipt(NaN));
++    await assert.rejects(service.verifyPurchase(subRequest), /valid expiry/);
++    assert.equal((await service.getEntitlements({ profileId: "player" })).no_ads.active, false);
++    for (const receipt_data of [undefined, {}, 42, " "]) {
++      await assert.rejects(appleService({}).verifyPurchase({ ...subRequest, payload: { receipt_data } }), /receipt_data is required/);
++    }
++  });
++
++  it("never grants indefinite or malformed stored subscriptions", async () => {
++    for (const expiresAt of [undefined, 0, NaN, Infinity, "bad", now - 1]) {
++      const store = new InMemoryIapStore();
++      await store.upsertSubscription("player", { active: true, status: "active", expiresAt });
++      const service = createIapService({ store, clock: () => now });
++      assert.equal((await service.getEntitlements({ profileId: "player" })).no_ads.active, false);
++    }
++  });
++
++  it("passes only construction-owned time to provider verification", async () => {
++    let received;
++    const service = createIapService({ clock: () => now, providerRegistry: { verifyPurchase: async (input) => {
++      received = input.nowSeconds;
++      return { provider: "apple", type: "subscription", externalTransactionId: "tx", subscription: { active: true, status: "active", expiresAt: now + 10 } };
++    } } });
++    await service.verifyPurchase({ ...subRequest, nowSeconds: 1 });
++    assert.equal(received, now);
++  });
++});
++
++describe("PayPal captured-payment verification", () => {
++  it("grants a completed captured payment once, preserving order-ID deduplication", async () => {
++    const service = paypalService(completedOrder());
++    const first = await service.verifyPurchase(paypalRequest);
++    const again = await service.verifyPurchase(paypalRequest);
++    assert.equal(first.purchase.externalTransactionId, "ORDER-1");
++    assert.equal(first.entitlements.coins.lumarush.balance, 500);
++    assert.equal(again.deduplicated, true);
++    assert.equal(again.entitlements.coins.lumarush.balance, 500);
++  });
++
++  for (const status of ["APPROVED", "CREATED", "PAYER_ACTION_REQUIRED", "", undefined]) {
++    it(`rejects uncaptured order status ${status}`, async () => {
++      const order = completedOrder(); order.status = status;
++      const service = paypalService(order);
++      await assert.rejects(service.verifyPurchase(paypalRequest), /order not complete/);
++      assert.deepEqual((await service.getEntitlements({ profileId: "player" })).coins, {});
++    });
++  }
++
++  it("rejects missing/pending captures, mismatched order and incomplete amount data", async () => {
++    const changes = [
++      (o) => { delete o.purchase_units[0].payments; },
++      (o) => { o.purchase_units[0].payments.captures[0].status = "PENDING"; },
++      (o) => { o.id = "OTHER"; },
++      (o) => { o.purchase_units[0].payments.captures[0].amount.value = "0.98"; },
++      (o) => { delete o.purchase_units[0].payments.captures[0].amount.currency_code; },
++      (o) => { o.purchase_units[0].amount.value = "NaN"; },
++      (o) => { o.purchase_units.push(o.purchase_units[0]); }
++    ];
++    for (const change of changes) {
++      const order = completedOrder(); change(order);
++      await assert.rejects(paypalService(order).verifyPurchase(paypalRequest), /paypal/);
++    }
++  });
++
++  it("rejects subscription Orders payloads regardless of client expiry, before network", async () => {
++    let requests = 0;
++    const service = paypalService(completedOrder(), () => requests++);
++    await assert.rejects(service.verifyPurchase({ ...paypalRequest, productId: "no_ads_monthly", payload: { order_id: "ORDER-1", expires_at: now + 1_000_000, now_seconds: 1 } }), /subscription verification is not supported/);
++    assert.equal(requests, 0);
++  });
++
++  it("rejects malformed order IDs and unconfigured credentials", async () => {
++    const provider = createPaypalWebProvider({ fetch: () => { throw new Error("unexpected network"); } });
++    for (const order_id of [undefined, 42, {}, " "]) {
++      await assert.rejects(provider.verifyPurchase({ payload: { order_id }, catalogEntry: { type: "consumable" } }), /order_id is required/);
++    }
++    await assert.rejects(provider.verifyPurchase({ payload: { order_id: "ORDER-1" }, catalogEntry: { type: "consumable" } }), /credentials are not configured/);
++  });
++});
++
++describe("Google verified subscription response (mocked OAuth and publisher API)", () => {
++  function serviceFor(t, subscription) {
++    // No credentials or signing keys are generated; OAuth signatures and HTTP
++    // responses are test doubles, not evidence of live Google verification.
++    t.mock.method(crypto, "createSign", () => ({ update() {}, end() {}, sign() { return Buffer.from("test-signature"); } }));
++    return createIapService({ clock: () => now, providers: { google: {
++      clientEmail: "test@example.invalid", privateKey: "test-key-placeholder",
++      fetch: async (url) => url.includes("oauth2") ? json({ access_token: "test-token" }) : json(subscription)
++    } } });
++  }
++  const request = { profileId: "player", provider: "google", productId: "no_ads_monthly", exportTarget: "android", payload: { package_name: "test.game", purchase_token: "test-purchase", now_seconds: 1, expires_at: now + 99999 } };
++  const sub = (state, offset = 10, productId = "no_ads_monthly") => ({ latestOrderId: "google-order", subscriptionState: state, lineItems: [{ productId, expiryTime: new Date((now + offset) * 1000).toISOString() }] });
++  for (const [state, active] of [["ACTIVE", true], ["CANCELED", true], ["IN_GRACE_PERIOD", true], ["ON_HOLD", false], ["PAUSED", false], ["PENDING", false]]) {
++    it(`handles verified state ${state}`, async (t) => {
++      const service = serviceFor(t, sub(`SUBSCRIPTION_STATE_${state}`));
++      assert.equal((await service.verifyPurchase(request)).entitlements.no_ads.active, active);
++    });
++  }
++  it("expires exactly at the server boundary despite client clock override", async (t) => {
++    const service = serviceFor(t, sub("SUBSCRIPTION_STATE_ACTIVE", 0));
++    assert.equal((await service.verifyPurchase(request)).entitlements.no_ads.active, false);
++  });
++  it("rejects missing state, wrong product and malformed expiry", async (t) => {
++    for (const reply of [sub("", 10), sub("SUBSCRIPTION_STATE_ACTIVE", 10, "other"), { ...sub("SUBSCRIPTION_STATE_ACTIVE"), lineItems: [{ productId: "no_ads_monthly", expiryTime: "bad" }] }]) {
++      await assert.rejects(serviceFor(t, reply).verifyPurchase(request), /google subscription missing/);
++    }
++  });
++});
+-- 
+2.39.3 (Apple Git-145)
+
+
+From 81f65f7012af159d769b107f67767f4d196a992c Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:12:27 -0500
+Subject: [PATCH 5/6] Pin PostgreSQL merge transactions and consume identity
+ tokens once
+
+---
+ packages/shared-utils/index.js                |   1 +
+ .../shared-utils/src/postgresTransaction.js   |  27 +++
+ services/iap-service/README.md                |  36 +++
+ .../iap-service/src/store/postgresIapStore.js |  34 +--
+ services/identity-gateway/README.md           |  57 +++++
+ .../identity-gateway/src/identityStore.js     |  78 +++---
+ test/identity-single-use-http.test.js         |  20 ++
+ test/postgres-consumption-integration.test.js | 118 ++++++++++
+ test/postgres-consumption.test.js             | 222 ++++++++++++++++++
+ 9 files changed, 543 insertions(+), 50 deletions(-)
+ create mode 100644 packages/shared-utils/src/postgresTransaction.js
+ create mode 100644 test/identity-single-use-http.test.js
+ create mode 100644 test/postgres-consumption-integration.test.js
+ create mode 100644 test/postgres-consumption.test.js
+
+diff --git a/packages/shared-utils/index.js b/packages/shared-utils/index.js
+index 93e07f6..cdc8006 100644
+--- a/packages/shared-utils/index.js
++++ b/packages/shared-utils/index.js
+@@ -13,3 +13,4 @@ export {
+   createRuntimeConfigProvider,
+   createNoopRuntimeConfigProvider
+ } from "./src/platformRuntimeConfigProvider.js";
++export { withPostgresTransaction } from "./src/postgresTransaction.js";
+diff --git a/packages/shared-utils/src/postgresTransaction.js b/packages/shared-utils/src/postgresTransaction.js
+new file mode 100644
+index 0000000..023184d
+--- /dev/null
++++ b/packages/shared-utils/src/postgresTransaction.js
+@@ -0,0 +1,27 @@
++// A transaction owns one checked-out client, including any helper queries.
++export async function withPostgresTransaction(pool, operation) {
++  const client = await pool.connect();
++  let began = false;
++  let releaseError;
++  try {
++    await client.query("BEGIN");
++    began = true;
++    const result = await operation(client);
++    await client.query("COMMIT");
++    return result;
++  } catch (error) {
++    if (began) {
++      try {
++        await client.query("ROLLBACK");
++      } catch (rollbackError) {
++        releaseError = rollbackError;
++      }
++    } else {
++      releaseError = error;
++    }
++    throw error;
++  } finally {
++    // A failed rollback leaves connection state uncertain; discard that client.
++    client.release(releaseError);
++  }
++}
+diff --git a/services/iap-service/README.md b/services/iap-service/README.md
+index 605f891..9c6a524 100644
+--- a/services/iap-service/README.md
++++ b/services/iap-service/README.md
+@@ -202,3 +202,39 @@ PostgreSQL integration test remains unexecuted and is a release gate. No new
+ credentials, secrets, provider settings, deployments or system services are
+ created/configured. Publication waits for authorized GitHub authentication;
+ reviewed main commits must precede staging, then production.
++
++## PostgreSQL profile-merge transaction ownership
++
++The PostgreSQL store now pins profile merging to one checked-out client, including
++subscription reads/writes. A SHARE ROW EXCLUSIVE lock on `iap_coin_balances` and
++`iap_subscriptions` serializes merge writers and ordinary INSERT/UPDATE/DELETE
++operations during the local transfer, including legacy writers without advisory
++lock cooperation. This prevents two overlapping merges from copying the same
++secondary balance or a wallet writer changing rows between copying and zeroing.
++Subscription choice and `{ merged: true|false }` response semantics are unchanged.
++Errors roll back the complete transfer and release the client; rollback failure
++discards the connection without replacing the original error.
++
++The table-wide locks are deliberately conservative and can delay grants/debits
++for other profiles while a merge runs. There are no remote calls inside the
++transaction. Validate this latency/locking tradeoff and the runtime DB role's
++ability to take these locks before release; no permissions/configuration are
++changed here. No schema migration is required.
++
++This patch uses original main baseline `bfa6290`, without a wallet or billing
++branch dependency. Its subscription-write helper extraction mirrors the wallet
++atomicity patch, so integration should retain both the atomic wallet operation
++and pinned merge helpers. This branch alone does not contain the earlier wallet
++atomicity fix. All approved fixes still require review/integration into main
++before staging and production.
++
++A grant made to the secondary profile after merge commit stays on that profile;
++this patch does not redirect late writes or implement durable merge jobs. The
++cross-service coordinator, idempotent saga/reconciliation, memory-store merge
++concurrency and JSON file-store follow-up are separate changes. Existing
++subscription/provider/webhook behavior is unchanged.
++
++`test/postgres-consumption.test.js` checks pinned SQL and injected failures using
++scripted clients. Optional real local DB tests and installed-tool availability
++are documented in the identity-gateway README. Real PostgreSQL concurrency,
++rollback and lock behavior have not been executed here and remain a release gate.
+diff --git a/services/iap-service/src/store/postgresIapStore.js b/services/iap-service/src/store/postgresIapStore.js
+index 34f4f1b..aec734d 100644
+--- a/services/iap-service/src/store/postgresIapStore.js
++++ b/services/iap-service/src/store/postgresIapStore.js
+@@ -1,4 +1,5 @@
+ import { validateTransactionEffect } from "./transactionEffect.js";
++import { withPostgresTransaction } from "../../../../packages/shared-utils/index.js";
+ 
+ export class PostgresIapStore {
+   constructor(options = {}) {
+@@ -150,7 +151,11 @@ export class PostgresIapStore {
+   }
+ 
+   async getSubscription(profileId) {
+-    const result = await this._pool.query(
++    return this._getSubscription(this._pool, profileId);
++  }
++
++  async _getSubscription(executor, profileId) {
++    const result = await executor.query(
+       `SELECT provider, external_subscription_id, status, active, expires_at
+        FROM iap_subscriptions WHERE profile_id = $1 LIMIT 1`,
+       [normalize(profileId)]
+@@ -210,9 +215,12 @@ export class PostgresIapStore {
+       return { merged: false };
+     }
+ 
+-    await this._pool.query("BEGIN");
+-    try {
+-      const secondaryCoins = await this._pool.query(
++    return withPostgresTransaction(this._pool, async (client) => {
++      // Rare account merges serialize writers on these tables, including legacy
++      // callers that do not participate in application-specific advisory locks.
++      // Reads remain available. Keep the whole transfer on this client.
++      await client.query("LOCK TABLE iap_coin_balances, iap_subscriptions IN SHARE ROW EXCLUSIVE MODE");
++      const secondaryCoins = await client.query(
+         `SELECT game_id, balance FROM iap_coin_balances WHERE profile_id = $1`,
+         [secondary]
+       );
+@@ -221,7 +229,7 @@ export class PostgresIapStore {
+         if (delta <= 0) {
+           continue;
+         }
+-        await this._pool.query(
++        await client.query(
+           `
+           INSERT INTO iap_coin_balances (profile_id, game_id, balance, updated_at)
+           VALUES ($1, $2, $3, NOW())
+@@ -231,26 +239,22 @@ export class PostgresIapStore {
+           [primary, row.game_id, delta]
+         );
+       }
+-      await this._pool.query(
++      await client.query(
+         `UPDATE iap_coin_balances SET balance = 0, updated_at = NOW() WHERE profile_id = $1`,
+         [secondary]
+       );
+ 
+-      const primarySub = await this.getSubscription(primary);
+-      const secondarySub = await this.getSubscription(secondary);
++      const primarySub = await this._getSubscription(client, primary);
++      const secondarySub = await this._getSubscription(client, secondary);
+       const chosen = chooseSubscription(primarySub, secondarySub);
+-      await this.upsertSubscription(primary, chosen);
+-      await this.upsertSubscription(secondary, {
++      await this._writeSubscription(client, primary, chosen);
++      await this._writeSubscription(client, secondary, {
+         active: false,
+         status: "merged",
+         provider: chosen.provider || ""
+       });
+-      await this._pool.query("COMMIT");
+       return { merged: true };
+-    } catch (error) {
+-      await this._pool.query("ROLLBACK");
+-      throw error;
+-    }
++    });
+   }
+ 
+   async close() {
+diff --git a/services/identity-gateway/README.md b/services/identity-gateway/README.md
+index 2e78231..f21c1d5 100644
+--- a/services/identity-gateway/README.md
++++ b/services/identity-gateway/README.md
+@@ -170,3 +170,60 @@ not trigger the checked-in deployment workflows. Tag/manual workflows do not
+ currently enforce ancestry from main; release operators must select a reviewed
+ main revision. No merge, tag, workflow dispatch, deployment, or live configuration
+ change is part of this patch.
++
++## PostgreSQL transaction ownership and single-use consumption
++
++Merge-code redemption and magic-link consumption use a checked-out PostgreSQL
++client for BEGIN, row locking, validation, conditional consumption, helper calls
++and COMMIT. The shared `withPostgresTransaction` helper rolls back errors and
++releases in `finally`; a failed rollback discards the client while preserving the
++original error. Both token SELECTs use `FOR UPDATE`, followed by a conditional
++`used_at IS NULL` update with `RETURNING`. Reuse is rejected even if a stored
++used timestamp is zero. Validation/write failure rolls back consumption, so the
++same token/code remains usable if the failure occurred before commit.
++
++Merge-code redemption also locks `identity_merges` in SHARE ROW EXCLUSIVE mode
++while resolving both canonical profile IDs and writing the merge edge. This is
++a table-wide writer lock, held only for the local database transaction; ordinary
++reads continue. It intentionally trades brief merge-writer serialization for a
++stable canonical lookup. Existing direct markMerged/service merge flows are not
++converted into a cross-service saga by this patch.
++
++Memory parity fixes recheck merge-code usage after asynchronous profile lookup
++and validate missing magic-link profiles before marking the token used. Existing
++return fields, public completion HTML/cookie behavior and expiry comparison are
++preserved. No HTTP routes or session/provider authentication are changed here.
++
++Scope ends at the local-store commit. A downstream migration, notification,
++session-cookie or network failure after commit does not unconsume a token/code.
++Reliable cross-service merges and retry/reconciliation jobs remain separate work.
++A connection error around COMMIT can leave its outcome uncertain; do not assume
++an error proves rollback. Request a fresh magic link if completion cannot be
++recovered. No schema migration or live configuration changes are included.
++
++Validation: `test/postgres-consumption.test.js` uses scripted clients to verify
++same-client SQL, locks, conditional updates and rollback/release paths, plus real
++in-memory concurrent-use tests. `test/identity-single-use-http.test.js` checks
++unauthenticated public completion/cookie behavior and concurrent reuse rejection.
++These mocks do not demonstrate PostgreSQL lock behavior.
++
++`test/postgres-consumption-integration.test.js` provides two opt-in real database
++tests for concurrent code/token use, transactional fault/retry, repeated wallet
++merges and writer exclusion. They are skipped unless
++`CONSUMPTION_TEST_LOCAL_DATABASE_URL` explicitly names an existing loopback DB
++(no query-string overrides). Tests require the existing `pg` dependency and
++permission to create/drop their own isolated schema. They never read DATABASE_URL
++and never start a service. Run with Node 20:
++`node --test test/postgres-consumption-integration.test.js`.
++Real PostgreSQL execution remains unperformed and is a release gate.
++
++Local tools inspected: PostgreSQL 14.8 (`postgres`, `initdb`, `pg_ctl`, `psql`)
++and Docker 28.5.1 are installed. PostgreSQL did not respond on 127.0.0.1:5432 or
++the default /tmp socket; the configured Docker daemon at localhost:4243 was also
++unavailable. Options, requiring separate approval: create a disposable native
++cluster in a task/tmp directory with a private socket, or start an isolated
++PostgreSQL container once Docker is available. No service was started/installed,
++no existing database cluster was modified and no credentials were generated.
++
++References: https://node-postgres.com/features/transactions and
++https://www.postgresql.org/docs/14/explicit-locking.html.
+diff --git a/services/identity-gateway/src/identityStore.js b/services/identity-gateway/src/identityStore.js
+index 51f4f99..f1637e4 100644
+--- a/services/identity-gateway/src/identityStore.js
++++ b/services/identity-gateway/src/identityStore.js
+@@ -1,4 +1,5 @@
+ import crypto from "node:crypto";
++import { withPostgresTransaction } from "../../../packages/shared-utils/index.js";
+ 
+ export class InMemoryIdentityStore {
+   constructor() {
+@@ -86,7 +87,7 @@ export class InMemoryIdentityStore {
+     if (!record) {
+       throw new Error("merge code not found");
+     }
+-    if (record.usedAt) {
++    if (record.usedAt || record.usedBySecondaryProfileId) {
+       throw new Error("merge code already used");
+     }
+     if (record.expiresAt < now) {
+@@ -96,6 +97,11 @@ export class InMemoryIdentityStore {
+     if (primary === secondary) {
+       throw new Error("cannot merge an account into itself");
+     }
++    if (!primary || !secondary) throw new Error("invalid merge pair");
++    // Resolving canonical profiles above yields; recheck immediately before use.
++    if (record.usedAt || record.usedBySecondaryProfileId) {
++      throw new Error("merge code already used");
++    }
+     record.usedAt = now;
+     record.usedBySecondaryProfileId = secondary;
+     this._mergeCodes.set(codeHash, record);
+@@ -175,17 +181,18 @@ export class InMemoryIdentityStore {
+     if (!entry) {
+       throw new Error("magic link token not found");
+     }
+-    if (entry.usedAt) {
++    if (entry.usedAt || entry.usedByProfileId) {
+       throw new Error("magic link token already used");
+     }
+     if (entry.expiresAt < now) {
+       throw new Error("magic link token expired");
+     }
+-    entry.usedAt = now;
+-    entry.usedByProfileId = requestedProfileId || normalize(entry.profileId);
+-    if (!entry.usedByProfileId) {
++    const usedByProfileId = requestedProfileId || normalize(entry.profileId);
++    if (!usedByProfileId) {
+       throw new Error("magic link token missing profile");
+     }
++    entry.usedAt = now;
++    entry.usedByProfileId = usedByProfileId;
+     this._magicLinks.set(tokenHash, entry);
+     return {
+       email: entry.email,
+@@ -200,8 +207,8 @@ export class InMemoryIdentityStore {
+ export class PostgresIdentityStore {
+   constructor(options = {}) {
+     this._pool = options.pool;
+-    if (!this._pool || typeof this._pool.query !== "function") {
+-      throw new Error("PostgresIdentityStore requires pool.query");
++    if (!this._pool || typeof this._pool.query !== "function" || typeof this._pool.connect !== "function") {
++      throw new Error("PostgresIdentityStore requires pool.query and pool.connect");
+     }
+   }
+ 
+@@ -391,11 +398,15 @@ export class PostgresIdentityStore {
+   }
+ 
+   async resolvePrimaryProfileId(profileId) {
++    return this._resolvePrimaryProfileId(this._pool, profileId);
++  }
++
++  async _resolvePrimaryProfileId(executor, profileId) {
+     let current = normalize(profileId);
+     const visited = new Set();
+     while (current && !visited.has(current)) {
+       visited.add(current);
+-      const result = await this._pool.query(
++      const result = await executor.query(
+         `SELECT primary_profile_id FROM identity_merges WHERE secondary_profile_id = $1 LIMIT 1`,
+         [current]
+       );
+@@ -434,18 +445,16 @@ export class PostgresIdentityStore {
+   }
+ 
+   async redeemMergeCode(secondaryProfileId, code, options = {}) {
+-    const secondary = await this.resolvePrimaryProfileId(secondaryProfileId);
+     const now = toInt(options.nowSeconds, Math.floor(Date.now() / 1000));
+     const codeHash = hashCode(code);
+ 
+-    await this._pool.query("BEGIN");
+-    try {
+-      const codeRow = await this._pool.query(
++    return withPostgresTransaction(this._pool, async (client) => {
++      const codeRow = await client.query(
+         `
+         SELECT primary_profile_id, created_at, expires_at, used_at
+         FROM identity_merge_codes
+         WHERE code_hash = $1
+-        LIMIT 1
++        LIMIT 1 FOR UPDATE
+       `,
+         [codeHash]
+       );
+@@ -453,23 +462,29 @@ export class PostgresIdentityStore {
+       if (!row) {
+         throw new Error("merge code not found");
+       }
+-      if (toInt(row.used_at, 0) > 0) {
++      if (row.used_at !== null && row.used_at !== undefined) {
+         throw new Error("merge code already used");
+       }
+       if (toInt(row.expires_at, 0) < now) {
+         throw new Error("merge code expired");
+       }
+-      const primary = await this.resolvePrimaryProfileId(row.primary_profile_id);
++      // Keep canonical resolution stable against concurrent merge-edge writes.
++      await client.query("LOCK TABLE identity_merges IN SHARE ROW EXCLUSIVE MODE");
++      const secondary = await this._resolvePrimaryProfileId(client, secondaryProfileId);
++      const primary = await this._resolvePrimaryProfileId(client, row.primary_profile_id);
++      if (!primary || !secondary) throw new Error("invalid merge pair");
+       if (primary === secondary) {
+         throw new Error("cannot merge an account into itself");
+       }
+-      await this._pool.query(
++      const consumed = await client.query(
+         `UPDATE identity_merge_codes
+          SET used_at = $2, used_by_secondary_profile_id = $3
+-         WHERE code_hash = $1`,
++         WHERE code_hash = $1 AND used_at IS NULL
++         RETURNING code_hash`,
+         [codeHash, now, secondary]
+       );
+-      await this._pool.query(
++      if (consumed.rows.length !== 1) throw new Error("merge code already used");
++      await client.query(
+         `
+         INSERT INTO identity_merges (secondary_profile_id, primary_profile_id, merged_at)
+         VALUES ($1, $2, $3)
+@@ -479,16 +494,12 @@ export class PostgresIdentityStore {
+       `,
+         [secondary, primary, now]
+       );
+-      await this._pool.query("COMMIT");
+       return {
+         primaryProfileId: primary,
+         secondaryProfileId: secondary,
+         mergedAt: now
+       };
+-    } catch (error) {
+-      await this._pool.query("ROLLBACK");
+-      throw error;
+-    }
++    });
+   }
+ 
+   async markMerged(primaryProfileId, secondaryProfileId, mergedAt) {
+@@ -572,14 +583,13 @@ export class PostgresIdentityStore {
+     const requestedProfileId = normalize(profileId);
+     const now = toInt(options.nowSeconds, Math.floor(Date.now() / 1000));
+     const tokenHash = hashCode(token);
+-    await this._pool.query("BEGIN");
+-    try {
+-      const result = await this._pool.query(
++    return withPostgresTransaction(this._pool, async (client) => {
++      const result = await client.query(
+         `
+         SELECT email, profile_id, game_id, expires_at, used_at
+         FROM identity_magic_links
+         WHERE token_hash = $1
+-        LIMIT 1
++        LIMIT 1 FOR UPDATE
+       `,
+         [tokenHash]
+       );
+@@ -587,7 +597,7 @@ export class PostgresIdentityStore {
+       if (!row) {
+         throw new Error("magic link token not found");
+       }
+-      if (toInt(row.used_at, 0) > 0) {
++      if (row.used_at !== null && row.used_at !== undefined) {
+         throw new Error("magic link token already used");
+       }
+       if (toInt(row.expires_at, 0) < now) {
+@@ -598,15 +608,16 @@ export class PostgresIdentityStore {
+       if (!usedByProfileId) {
+         throw new Error("magic link token missing profile");
+       }
+-      await this._pool.query(
++      const consumed = await client.query(
+         `
+         UPDATE identity_magic_links
+         SET used_at = $2, used_by_profile_id = $3
+-        WHERE token_hash = $1
++        WHERE token_hash = $1 AND used_at IS NULL
++        RETURNING token_hash
+       `,
+         [tokenHash, now, usedByProfileId]
+       );
+-      await this._pool.query("COMMIT");
++      if (consumed.rows.length !== 1) throw new Error("magic link token already used");
+       return {
+         email: normalize(row.email),
+         profileId: tokenProfileId,
+@@ -614,10 +625,7 @@ export class PostgresIdentityStore {
+         usedByProfileId,
+         usedAt: now
+       };
+-    } catch (error) {
+-      await this._pool.query("ROLLBACK");
+-      throw error;
+-    }
++    });
+   }
+ 
+   async close() {
+diff --git a/test/identity-single-use-http.test.js b/test/identity-single-use-http.test.js
+new file mode 100644
+index 0000000..64dbac1
+--- /dev/null
++++ b/test/identity-single-use-http.test.js
+@@ -0,0 +1,20 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { createIdentityGatewayService, createIdentityGatewayHttpServer } from "../services/identity-gateway/index.js";
++
++it("public magic-link consumption preserves success HTML/cookie and rejects concurrent reuse", async () => {
++  const secret = "test-public-magic-link-session-secret";
++  const service = createIdentityGatewayService({ sessionSecret: secret });
++  const { token } = await service.identityStore.createMagicLinkToken("player@example.test", "profile", { gameId: "game" });
++  const server = createIdentityGatewayHttpServer({ service, sessionSecret: secret, webSessionCookieSecure: false });
++  const { baseUrl } = await server.listen();
++  try {
++    const responses = await Promise.all(Array.from({ length: 12 }, () => fetch(`${baseUrl}/v1/account/magic-link/consume?ml_token=${encodeURIComponent(token)}`)));
++    assert.equal(responses.filter((response) => response.status === 200).length, 1);
++    assert.equal(responses.filter((response) => response.status === 400).length, 11);
++    const success = responses.find((response) => response.status === 200);
++    assert.match(await success.text(), /Account Linked/i);
++    assert.match(success.headers.get("set-cookie"), /tpx_session=/);
++    assert.equal((await fetch(`${baseUrl}/v1/account/magic-link/consume?ml_token=${encodeURIComponent(token)}`)).status, 400);
++  } finally { await server.close(); }
++});
+diff --git a/test/postgres-consumption-integration.test.js b/test/postgres-consumption-integration.test.js
+new file mode 100644
+index 0000000..e3d12e7
+--- /dev/null
++++ b/test/postgres-consumption-integration.test.js
+@@ -0,0 +1,118 @@
++import { it } from "node:test";
++import assert from "node:assert/strict";
++import { PostgresIdentityStore } from "../services/identity-gateway/index.js";
++import { PostgresIapStore } from "../services/iap-service/index.js";
++
++// Requires an explicitly supplied already-running local DB. Never DATABASE_URL.
++const testOptions = { skip: !process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL, timeout: 30_000 };
++let schemaSequence = 0;
++async function withDatabase(run) {
++  const url = new URL(process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL);
++  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
++  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "database must be loopback");
++  assert.equal(url.search, "", "connection-string overrides are forbidden");
++  const { default: pg } = await import("pg");
++  const schema = `consumption_test_${process.pid}_${Date.now()}_${schemaSequence++}`;
++  const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
++  let pool, created = false;
++  try {
++    await admin.query(`CREATE SCHEMA ${schema}`); created = true;
++    pool = new pg.Pool({ connectionString: url.toString(), options: `-c search_path=${schema}`, max: 8, connectionTimeoutMillis: 3000 });
++    await run(pool);
++  } finally {
++    if (pool) await pool.end();
++    try { if (created) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
++    finally { await admin.end(); }
++  }
++}
++
++it("real local PostgreSQL: one-time identity consumption, rollback/retry and concurrency", testOptions, () => withDatabase(async (pool) => {
++  const store = new PostgresIdentityStore({ pool });
++  await store.init();
++  const now = Math.floor(Date.now() / 1000);
++  const code = await store.createMergeCode("primary", { nowSeconds: now });
++  await pool.query(`CREATE FUNCTION reject_edge() RETURNS trigger LANGUAGE plpgsql AS $$
++    BEGIN RAISE EXCEPTION 'injected edge failure'; END $$`);
++  await pool.query("CREATE TRIGGER reject_edge BEFORE INSERT ON identity_merges FOR EACH ROW EXECUTE FUNCTION reject_edge()");
++  await assert.rejects(store.redeemMergeCode("secondary", code.code, { nowSeconds: now }), /injected edge failure/);
++  assert.equal((await pool.query("SELECT used_at FROM identity_merge_codes")).rows[0].used_at, null);
++  assert.equal((await pool.query("SELECT COUNT(*)::int AS n FROM identity_merges")).rows[0].n, 0);
++  await pool.query("DROP TRIGGER reject_edge ON identity_merges");
++  assert.equal((await store.redeemMergeCode("secondary", code.code, { nowSeconds: now })).primaryProfileId, "primary");
++  await assert.rejects(store.redeemMergeCode("other", code.code, { nowSeconds: now }), /already used/);
++
++  const concurrentCode = await store.createMergeCode("other-primary", { nowSeconds: now });
++  const codes = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => store.redeemMergeCode(`other-secondary-${i}`, concurrentCode.code, { nowSeconds: now })));
++  assert.equal(codes.filter((result) => result.status === "fulfilled").length, 1);
++  assert.equal(codes.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++
++  const magic = await store.createMagicLinkToken("player@example.test", "profile", { nowSeconds: now, gameId: "game" });
++  await pool.query(`CREATE FUNCTION reject_magic() RETURNS trigger LANGUAGE plpgsql AS $$
++    BEGIN RAISE EXCEPTION 'injected magic failure'; END $$`);
++  await pool.query("CREATE TRIGGER reject_magic BEFORE UPDATE ON identity_magic_links FOR EACH ROW EXECUTE FUNCTION reject_magic()");
++  await assert.rejects(store.consumeMagicLinkToken("", magic.token, { nowSeconds: now }), /injected magic failure/);
++  assert.equal((await pool.query("SELECT used_at FROM identity_magic_links")).rows[0].used_at, null);
++  await pool.query("DROP TRIGGER reject_magic ON identity_magic_links");
++  const tokens = await Promise.allSettled(Array.from({ length: 20 }, () => store.consumeMagicLinkToken("", magic.token, { nowSeconds: now })));
++  assert.equal(tokens.filter((result) => result.status === "fulfilled").length, 1);
++  assert.equal(tokens.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++  const result = tokens.find((item) => item.status === "fulfilled").value;
++  assert.deepEqual(result, { email: "player@example.test", profileId: "profile", gameId: "game", usedByProfileId: "profile", usedAt: now });
++}));
++
++it("real local PostgreSQL: IAP merge rollback, repeated merges and writer exclusion", testOptions, () => withDatabase(async (pool) => {
++  const store = new PostgresIapStore({ pool });
++  await store.init();
++  await store.addCoins("primary", "game", 10);
++  await store.addCoins("secondary", "game", 50);
++  await store.upsertSubscription("secondary", { provider: "apple", active: true, status: "active", expiresAt: 1_900_000_000 });
++  await pool.query(`CREATE FUNCTION reject_subscription() RETURNS trigger LANGUAGE plpgsql AS $$
++    BEGIN RAISE EXCEPTION 'injected subscription failure'; END $$`);
++  await pool.query("CREATE TRIGGER reject_subscription BEFORE INSERT OR UPDATE ON iap_subscriptions FOR EACH ROW EXECUTE FUNCTION reject_subscription()");
++  await assert.rejects(store.mergeProfiles("primary", "secondary"), /injected subscription failure/);
++  assert.equal((await store.getCoins("primary")).game.balance, 10);
++  assert.equal((await store.getCoins("secondary")).game.balance, 50);
++  assert.equal((await store.getSubscription("secondary")).active, true);
++  await pool.query("DROP TRIGGER reject_subscription ON iap_subscriptions");
++  const results = await Promise.all(Array.from({ length: 20 }, () => store.mergeProfiles("primary", "secondary")));
++  assert.ok(results.every((result) => result.merged));
++  assert.equal((await store.getCoins("primary")).game.balance, 60);
++  assert.equal((await store.getCoins("secondary")).game.balance, 0);
++  assert.equal((await store.getSubscription("primary")).active, true);
++  assert.equal((await store.getSubscription("secondary")).status, "merged");
++
++  // Pause a merge immediately after its real table lock. A separate ordinary
++  // UPDATE must time out instead of changing a wallet during the merge.
++  let entered, resume;
++  const started = new Promise((resolve) => { entered = resolve; });
++  const gate = new Promise((resolve) => { resume = resolve; });
++  const paused = new PostgresIapStore({ pool: {
++    query: pool.query.bind(pool),
++    async connect() {
++      const client = await pool.connect();
++      return {
++        async query(sql, params) {
++          const result = await client.query(sql, params);
++          if (sql.startsWith("LOCK TABLE iap_coin_balances")) { entered(); await gate; }
++          return result;
++        },
++        release: client.release.bind(client)
++      };
++    }
++  } });
++  const merge = paused.mergeProfiles("primary", "secondary");
++  await started;
++  const writer = await pool.connect();
++  try {
++    await writer.query("BEGIN");
++    await writer.query("SET LOCAL lock_timeout = '100ms'");
++    await assert.rejects(writer.query("UPDATE iap_coin_balances SET balance = balance + 1 WHERE profile_id = 'secondary'"), /lock timeout/);
++  } finally {
++    try { await writer.query("ROLLBACK"); }
++    finally { writer.release(); resume(); }
++  }
++  await merge;
++  await store.addCoins("secondary", "game", 1);
++  assert.equal((await store.getCoins("secondary")).game.balance, 1);
++  // Late writes are preserved, not redirected by this local-store patch.
++}));
+diff --git a/test/postgres-consumption.test.js b/test/postgres-consumption.test.js
+new file mode 100644
+index 0000000..4eca95e
+--- /dev/null
++++ b/test/postgres-consumption.test.js
+@@ -0,0 +1,222 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { withPostgresTransaction } from "../packages/shared-utils/index.js";
++import { InMemoryIdentityStore, PostgresIdentityStore } from "../services/identity-gateway/index.js";
++import { PostgresIapStore } from "../services/iap-service/index.js";
++
++// These scripted clients validate SQL and client ownership, not PostgreSQL locks.
++function fixture(Store, steps) {
++  const releases = [];
++  const events = [];
++  const client = {
++    async query(sql, params) {
++      const text = sql.replace(/\s+/g, " ").trim();
++      events.push(text);
++      const step = steps.shift();
++      assert.ok(step, `unexpected SQL: ${text}`);
++      assert.match(text, step.sql);
++      step.check?.(params);
++      if (step.error) throw step.error;
++      return { rows: step.rows || [] };
++    },
++    release(error) { releases.push(error); }
++  };
++  const pool = {
++    async connect() { return client; },
++    async query() { throw new Error("transaction escaped to pool.query"); }
++  };
++  return { store: Store ? new Store({ pool }) : null, pool, steps, releases, events };
++}
++const begin = { sql: /^BEGIN$/ };
++const commit = { sql: /^COMMIT$/ };
++const rollback = { sql: /^ROLLBACK$/ };
++const codeRow = { primary_profile_id: "primary", created_at: 100, expires_at: 1000, used_at: null };
++const codeSelect = { sql: /FROM identity_merge_codes.*LIMIT 1 FOR UPDATE/, rows: [codeRow] };
++const edgeLock = { sql: /^LOCK TABLE identity_merges IN SHARE ROW EXCLUSIVE MODE$/ };
++const resolve = { sql: /^SELECT primary_profile_id FROM identity_merges/ };
++const codeUse = { sql: /^UPDATE identity_merge_codes.*used_at IS NULL.*RETURNING code_hash/, rows: [{ code_hash: "hash" }] };
++const mergeEdge = { sql: /^INSERT INTO identity_merges/ };
++const magicRow = { email: "player@example.test", profile_id: "profile", game_id: "game", expires_at: 1000, used_at: null };
++const magicSelect = { sql: /FROM identity_magic_links.*LIMIT 1 FOR UPDATE/, rows: [magicRow] };
++const magicUse = { sql: /^UPDATE identity_magic_links.*used_at IS NULL.*RETURNING token_hash/, rows: [{ token_hash: "hash" }] };
++const coinLock = { sql: /^LOCK TABLE iap_coin_balances, iap_subscriptions IN SHARE ROW EXCLUSIVE MODE$/ };
++const coinRead = { sql: /^SELECT game_id, balance FROM iap_coin_balances/, rows: [{ game_id: "game", balance: 50 }] };
++const coinCredit = { sql: /^INSERT INTO iap_coin_balances/, check: (params) => assert.deepEqual(params, ["primary", "game", 50]) };
++const coinClear = { sql: /^UPDATE iap_coin_balances SET balance = 0/ };
++const subRead = { sql: /^SELECT provider, external_subscription_id, status, active, expires_at FROM iap_subscriptions/ };
++const subWrite = { sql: /^INSERT INTO iap_subscriptions/ };
++
++function assertFinished(f) {
++  assert.equal(f.steps.length, 0);
++  assert.deepEqual(f.releases, [undefined]);
++}
++
++describe("checked-out PostgreSQL transaction ownership (scripted clients)", () => {
++  it("commits and releases on success", async () => {
++    const f = fixture(null, [begin, { sql: /^SELECT 1$/ }, commit]);
++    assert.equal(await withPostgresTransaction(f.pool, async (client) => { await client.query("SELECT 1"); return "result"; }), "result");
++    assertFinished(f);
++  });
++
++  for (const stage of ["begin", "operation", "commit"]) {
++    it(`preserves ${stage} failure and releases`, async () => {
++      const error = new Error(`${stage} failure`);
++      const sequence = stage === "begin" ? [{ ...begin, error }] : stage === "commit" ? [begin, { ...commit, error }, rollback] : [begin, rollback];
++      const f = fixture(null, sequence);
++      await assert.rejects(withPostgresTransaction(f.pool, async () => { if (stage === "operation") throw error; }), (actual) => actual === error);
++      assert.equal(f.steps.length, 0);
++      assert.deepEqual(f.releases, [stage === "begin" ? error : undefined]);
++    });
++  }
++
++  it("preserves original error and discards client if rollback fails", async () => {
++    const error = new Error("original");
++    const rollbackError = new Error("connection lost");
++    const f = fixture(null, [begin, { ...rollback, error: rollbackError }]);
++    await assert.rejects(withPostgresTransaction(f.pool, async () => { throw error; }), (actual) => actual === error);
++    assert.deepEqual(f.releases, [rollbackError]);
++  });
++
++  it("does not release an unacquired client", async () => {
++    const error = new Error("pool unavailable");
++    await assert.rejects(withPostgresTransaction({ connect: async () => { throw error; } }, () => {}), (actual) => actual === error);
++  });
++});
++
++describe("Postgres identity consumption (scripted clients)", () => {
++  it("locks a merge code and resolves canonical IDs on the transaction client", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, codeSelect, edgeLock,
++      { ...resolve, rows: [{ primary_profile_id: "secondary-root" }] }, resolve,
++      { ...resolve, rows: [{ primary_profile_id: "primary-root" }] }, resolve,
++      { ...codeUse, check(params) { assert.equal(params[2], "secondary-root"); } },
++      { ...mergeEdge, check(params) { assert.deepEqual(params, ["secondary-root", "primary-root", 200]); } }, commit]);
++    assert.deepEqual(await f.store.redeemMergeCode("secondary", "test-code", { nowSeconds: 200 }), { primaryProfileId: "primary-root", secondaryProfileId: "secondary-root", mergedAt: 200 });
++    assertFinished(f);
++  });
++
++  it("consumes a public magic link without changing its response fields", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, magicSelect, magicUse, commit]);
++    assert.deepEqual(await f.store.consumeMagicLinkToken("", "test-token", { nowSeconds: 200 }), { email: "player@example.test", profileId: "profile", gameId: "game", usedByProfileId: "profile", usedAt: 200 });
++    assertFinished(f);
++  });
++
++  for (const [label, method, select, row] of [
++    ["merge code", "redeemMergeCode", codeSelect, codeRow],
++    ["magic link token", "consumeMagicLinkToken", magicSelect, magicRow]
++  ]) {
++    for (const [reason, replacement] of [["not found", null], ["already used", { ...row, used_at: 0 }], ["expired", { ...row, expires_at: 199 }]]) {
++      it(`rejects ${reason} ${label} and rolls back/releases`, async () => {
++        const f = fixture(PostgresIdentityStore, [begin, { ...select, rows: replacement ? [replacement] : [] }, rollback]);
++        await assert.rejects(f.store[method]("secondary", "test-value", { nowSeconds: 200 }), new RegExp(reason));
++        assertFinished(f);
++      });
++    }
++  }
++
++  it("self merge is rejected without consuming the code", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, codeSelect, edgeLock, resolve, resolve, rollback]);
++    await assert.rejects(f.store.redeemMergeCode("primary", "code", { nowSeconds: 200 }), /itself/);
++    assertFinished(f);
++  });
++
++  it("empty profile validation rolls back a magic link before consumption", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, { ...magicSelect, rows: [{ ...magicRow, profile_id: "" }] }, rollback]);
++    await assert.rejects(f.store.consumeMagicLinkToken("", "token", { nowSeconds: 200 }), /missing profile/);
++    assertFinished(f);
++  });
++
++  it("defensively rejects a lost conditional consume", async () => {
++    const f = fixture(PostgresIdentityStore, [begin, magicSelect, { ...magicUse, rows: [] }, rollback]);
++    await assert.rejects(f.store.consumeMagicLinkToken("", "token", { nowSeconds: 200 }), /already used/);
++    assertFinished(f);
++  });
++
++  it("rolls back code consumption if writing the merge edge fails", async () => {
++    const error = new Error("edge write failed");
++    const f = fixture(PostgresIdentityStore, [begin, codeSelect, edgeLock, resolve, resolve, codeUse, { ...mergeEdge, error }, rollback]);
++    await assert.rejects(f.store.redeemMergeCode("secondary", "code", { nowSeconds: 200 }), (actual) => actual === error);
++    assertFinished(f);
++  });
++
++  it("rolls back token update failure", async () => {
++    const error = new Error("consume failed");
++    const f = fixture(PostgresIdentityStore, [begin, magicSelect, { ...magicUse, error }, rollback]);
++    await assert.rejects(f.store.consumeMagicLinkToken("", "token", { nowSeconds: 200 }), (actual) => actual === error);
++    assertFinished(f);
++  });
++});
++
++describe("Postgres IAP profile merge (scripted clients)", () => {
++  it("locks writers and keeps transfer and all subscription helpers on one client", async () => {
++    const f = fixture(PostgresIapStore, [begin, coinLock, coinRead, coinCredit, coinClear, subRead,
++      { ...subRead, rows: [{ provider: "apple", active: true, status: "active", expires_at: "2030-01-01T00:00:00Z" }] },
++      { ...subWrite, check(params) { assert.equal(params[0], "primary"); assert.equal(params[4], true); } },
++      { ...subWrite, check(params) { assert.equal(params[0], "secondary"); assert.equal(params[3], "merged"); assert.equal(params[4], false); } }, commit]);
++    assert.deepEqual(await f.store.mergeProfiles("primary", "secondary"), { merged: true });
++    assertFinished(f);
++  });
++
++  for (const stage of ["credit", "clear", "subscription"]) {
++    it(`rolls back complete merge on ${stage} failure`, async () => {
++      const error = new Error(`${stage} failed`);
++      const prefix = [begin, coinLock, coinRead];
++      const steps = stage === "credit" ? [...prefix, { ...coinCredit, error }] : stage === "clear" ? [...prefix, coinCredit, { ...coinClear, error }] : [...prefix, coinCredit, coinClear, subRead, subRead, { ...subWrite, error }];
++      const f = fixture(PostgresIapStore, [...steps, rollback]);
++      await assert.rejects(f.store.mergeProfiles("primary", "secondary"), (actual) => actual === error);
++      assertFinished(f);
++    });
++  }
++
++  it("does not connect for an invalid/self pair", async () => {
++    const f = fixture(PostgresIapStore, []);
++    assert.deepEqual(await f.store.mergeProfiles("primary", "primary"), { merged: false });
++    assert.deepEqual(await f.store.mergeProfiles("", "secondary"), { merged: false });
++    assert.deepEqual(f.releases, []);
++  });
++});
++
++describe("in-memory identity single-use parity", () => {
++  it("allows exactly one concurrent merge-code redemption", async () => {
++    const store = new InMemoryIdentityStore();
++    const { code } = await store.createMergeCode("primary", { nowSeconds: 100 });
++    const results = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => store.redeemMergeCode(`secondary-${i}`, code, { nowSeconds: 200 })));
++    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
++    assert.equal(results.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++  });
++
++  it("allows exactly one concurrent public magic-link consumption", async () => {
++    const store = new InMemoryIdentityStore();
++    const { token } = await store.createMagicLinkToken("p@example.test", "profile", { nowSeconds: 100 });
++    const results = await Promise.allSettled(Array.from({ length: 20 }, () => store.consumeMagicLinkToken("", token, { nowSeconds: 200 })));
++    assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
++    assert.equal(results.filter((result) => result.status === "rejected" && /already used/.test(result.reason.message)).length, 19);
++  });
++
++  it("rejects token reuse even when a test clock records usedAt zero", async () => {
++    const store = new InMemoryIdentityStore();
++    const { token } = await store.createMagicLinkToken("p@example.test", "profile", { nowSeconds: 0 });
++    await store.consumeMagicLinkToken("", token, { nowSeconds: 0 });
++    await assert.rejects(store.consumeMagicLinkToken("", token, { nowSeconds: 0 }), /already used/);
++  });
++
++  it("rejects code reuse even when a test clock records usedAt zero", async () => {
++    const store = new InMemoryIdentityStore();
++    const { code } = await store.createMergeCode("primary", { nowSeconds: 0 });
++    await store.redeemMergeCode("secondary", code, { nowSeconds: 0 });
++    await assert.rejects(store.redeemMergeCode("another", code, { nowSeconds: 0 }), /already used/);
++  });
++
++  it("does not consume a token on missing-profile validation failure", async () => {
++    const store = new InMemoryIdentityStore();
++    const { token } = await store.createMagicLinkToken("p@example.test", "", { nowSeconds: 100 });
++    await assert.rejects(store.consumeMagicLinkToken("", token, { nowSeconds: 200 }), /missing profile/);
++    assert.equal((await store.consumeMagicLinkToken("profile", token, { nowSeconds: 200 })).usedByProfileId, "profile");
++  });
++
++  it("does not consume a merge code on invalid-pair validation failure", async () => {
++    const store = new InMemoryIdentityStore();
++    const { code } = await store.createMergeCode("primary", { nowSeconds: 100 });
++    await assert.rejects(store.redeemMergeCode("", code, { nowSeconds: 200 }), /invalid merge pair/);
++    assert.equal((await store.redeemMergeCode("secondary", code, { nowSeconds: 200 })).primaryProfileId, "primary");
++  });
++});
+-- 
+2.39.3 (Apple Git-145)
+
+
+From 90feb4de1ac52070b2caac601e5baf9ab83abb8d Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:20:22 -0500
+Subject: [PATCH 6/6] Pin identity review CI actions to verified full commit
+ SHAs
+
+---
+ .github/workflows/ci.yml | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f69ee6f..cc044dd 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -11,9 +11,9 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+       - name: Checkout
+-        uses: actions/checkout@v4
++        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+       - name: Setup Node
+-        uses: actions/setup-node@v4
++        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+         with:
+           node-version: "20"
+           cache: "npm"
+-- 
+2.39.3 (Apple Git-145)
+

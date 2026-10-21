@@ -1,0 +1,308 @@
+From 63e9708e5f2f1907f63c1de7c0bb4708291a65ba Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Wed, 21 Oct 2026 09:47:05 -0500
+Subject: [PATCH] Require all data-safety PostgreSQL suites in isolated Compose
+ validation
+
+---
+ compose.test.yaml                             |  4 ++
+ infra/testing/runner.sh                       |  9 ++++-
+ test/local-postgres-url.test.js               | 10 +++++
+ test/postgres-consumption-integration.test.js |  6 +--
+ test/postgres-iap-integration.test.js         |  6 +--
+ test/postgres-save-integration.test.js        | 38 +++++++++++++++++--
+ tools/test-helpers/localPostgresUrl.js        | 13 +++++++
+ 7 files changed, 73 insertions(+), 13 deletions(-)
+ create mode 100644 test/local-postgres-url.test.js
+ create mode 100644 tools/test-helpers/localPostgresUrl.js
+
+diff --git a/compose.test.yaml b/compose.test.yaml
+index 2e0c5b2..1154b71 100644
+--- a/compose.test.yaml
++++ b/compose.test.yaml
+@@ -23,6 +23,10 @@ services:
+         condition: service_healthy
+     environment:
+       DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
++      IAP_TEST_LOCAL_DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
++      CONSUMPTION_TEST_LOCAL_DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
++      SAVE_TEST_LOCAL_DATABASE_URL: postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test
++      TPX_ISOLATED_COMPOSE_TEST: '1'
+       NODE_ENV: test
+     read_only: true
+     tmpfs:
+diff --git a/infra/testing/runner.sh b/infra/testing/runner.sh
+index ab765d0..c2ba24d 100644
+--- a/infra/testing/runner.sh
++++ b/infra/testing/runner.sh
+@@ -6,4 +6,11 @@ node infra/testing/postgres-check.mjs --preflight
+ npm run db:migrate
+ npm run db:migrate
+ node --test --test-reporter=spec infra/testing/postgres-check.mjs
+-npm test
++# All real-PG suites are mandatory in this harness. No fallback DATABASE_URL.
++for name in IAP_TEST_LOCAL_DATABASE_URL CONSUMPTION_TEST_LOCAL_DATABASE_URL SAVE_TEST_LOCAL_DATABASE_URL; do
++  eval "value=\${$name:-}"
++  test -n "$value"
++done
++npm test > /tmp/platform-suite.log 2>&1 || { cat /tmp/platform-suite.log; exit 1; }
++cat /tmp/platform-suite.log
++node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const log=fs.readFileSync("/tmp/platform-suite.log","utf8"); assert.match(log,/skipped 0(?:\r?\n|$)/,"Docker data-stack suite must have zero skips"); for (const marker of ["real local PostgreSQL: atomic grants", "real local PostgreSQL: one-time identity", "real local PostgreSQL: IAP merge", "real local PostgreSQL: concurrent save"]) assert.ok(log.includes(marker), "missing mandatory suite: "+marker);'
+diff --git a/test/local-postgres-url.test.js b/test/local-postgres-url.test.js
+new file mode 100644
+index 0000000..67339e7
+--- /dev/null
++++ b/test/local-postgres-url.test.js
+@@ -0,0 +1,10 @@
++import { it } from 'node:test';
++import assert from 'node:assert/strict';
++import { localPostgresUrl, COMPOSE_TEST_DATABASE_URL } from '../tools/test-helpers/localPostgresUrl.js';
++it('integration DB URL guard permits only loopback or explicitly marked exact synthetic Compose fixture',()=>{
++ assert.equal(localPostgresUrl('postgresql://test:test@127.0.0.1:5432/test',{}).hostname,'127.0.0.1');
++ assert.throws(()=>localPostgresUrl(COMPOSE_TEST_DATABASE_URL,{}),/loopback/);
++ assert.equal(localPostgresUrl(COMPOSE_TEST_DATABASE_URL,{TPX_ISOLATED_COMPOSE_TEST:'1'}).hostname,'postgres');
++ for(const url of [COMPOSE_TEST_DATABASE_URL.replace('@postgres:', '@remote.example:'),COMPOSE_TEST_DATABASE_URL.replace('synthetic-local-only','different'),COMPOSE_TEST_DATABASE_URL+'?host=remote.example',COMPOSE_TEST_DATABASE_URL+'#override'])assert.throws(()=>localPostgresUrl(url,{TPX_ISOLATED_COMPOSE_TEST:'1'}));
++ assert.throws(()=>localPostgresUrl(undefined,{DATABASE_URL:COMPOSE_TEST_DATABASE_URL}),/Invalid URL/);
++});
+diff --git a/test/postgres-consumption-integration.test.js b/test/postgres-consumption-integration.test.js
+index e3d12e7..2422fe7 100644
+--- a/test/postgres-consumption-integration.test.js
++++ b/test/postgres-consumption-integration.test.js
+@@ -1,3 +1,4 @@
++import { localPostgresUrl } from "../tools/test-helpers/localPostgresUrl.js";
+ import { it } from "node:test";
+ import assert from "node:assert/strict";
+ import { PostgresIdentityStore } from "../services/identity-gateway/index.js";
+@@ -7,10 +8,7 @@ import { PostgresIapStore } from "../services/iap-service/index.js";
+ const testOptions = { skip: !process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL, timeout: 30_000 };
+ let schemaSequence = 0;
+ async function withDatabase(run) {
+-  const url = new URL(process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL);
+-  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
+-  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "database must be loopback");
+-  assert.equal(url.search, "", "connection-string overrides are forbidden");
++  const url = localPostgresUrl(process.env.CONSUMPTION_TEST_LOCAL_DATABASE_URL);
+   const { default: pg } = await import("pg");
+   const schema = `consumption_test_${process.pid}_${Date.now()}_${schemaSequence++}`;
+   const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
+diff --git a/test/postgres-iap-integration.test.js b/test/postgres-iap-integration.test.js
+index c92b384..c2b452f 100644
+--- a/test/postgres-iap-integration.test.js
++++ b/test/postgres-iap-integration.test.js
+@@ -1,3 +1,4 @@
++import { localPostgresUrl } from "../tools/test-helpers/localPostgresUrl.js";
+ import { it } from "node:test";
+ import assert from "node:assert/strict";
+ import { createIapService, PostgresIapStore } from "../services/iap-service/index.js";
+@@ -8,10 +9,7 @@ it("real local PostgreSQL: atomic grants, failed-debit retries and concurrent sp
+   skip: !process.env.IAP_TEST_LOCAL_DATABASE_URL,
+   timeout: 30_000
+ }, async () => {
+-  const url = new URL(process.env.IAP_TEST_LOCAL_DATABASE_URL);
+-  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
+-  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname), "integration DB must be loopback");
+-  assert.equal(url.search, "", "connection-string query overrides are not allowed");
++  const url = localPostgresUrl(process.env.IAP_TEST_LOCAL_DATABASE_URL);
+   const { default: pg } = await import("pg");
+   const schema = `iap_atomic_test_${process.pid}_${Date.now()}`;
+   const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
+diff --git a/test/postgres-save-integration.test.js b/test/postgres-save-integration.test.js
+index dfccafa..e5fbb20 100644
+--- a/test/postgres-save-integration.test.js
++++ b/test/postgres-save-integration.test.js
+@@ -1,3 +1,4 @@
++import { localPostgresUrl } from "../tools/test-helpers/localPostgresUrl.js";
+ import { it } from "node:test";
+ import assert from "node:assert/strict";
+ import { PostgresSaveStore, createSaveService, createDefaultSaveEnvelope } from "../services/save-service/index.js";
+@@ -6,10 +7,7 @@ it("real local PostgreSQL: concurrent save retries and atomic migration rollback
+   skip: !process.env.SAVE_TEST_LOCAL_DATABASE_URL, timeout: 30_000
+ }, async () => {
+   // Explicit opt-in only; never fall back to production DATABASE_URL.
+-  const url = new URL(process.env.SAVE_TEST_LOCAL_DATABASE_URL);
+-  assert.ok(["postgres:", "postgresql:"].includes(url.protocol));
+-  assert.ok(["localhost", "127.0.0.1", "[::1]"].includes(url.hostname));
+-  assert.equal(url.search, "", "connection-string overrides are forbidden");
++  const url = localPostgresUrl(process.env.SAVE_TEST_LOCAL_DATABASE_URL);
+   const { default: pg } = await import("pg");
+   const schema = `save_test_${process.pid}_${Date.now()}`;
+   const admin = new pg.Pool({ connectionString: url.toString(), max: 1, connectionTimeoutMillis: 3000 });
+@@ -55,6 +53,38 @@ it("real local PostgreSQL: concurrent save retries and atomic migration rollback
+     assert.equal((await a.get("game", "primary")).payload.games_played, 9);
+     assert.equal((await a.get("game", "primary")).payload.high_score, 400);
+     assert.equal(await a.get("game", "secondary"), null);
++
++    // Hold the real source row lock after reading an absent destination, then
++    // let another connection create that destination. INSERT must lose safely,
++    // rollback, and the service must retry/remerge on a fresh transaction.
++    await a.put(envelope("race-secondary", { games_played: 13, secondary_flag: true }));
++    let entered, resume, selections = 0;
++    const selected = new Promise((resolve) => { entered = resolve; });
++    const gate = new Promise((resolve) => { resume = resolve; });
++    const paused = new PostgresSaveStore({ pool: {
++      query: pool.query.bind(pool),
++      async connect() {
++        const client = await pool.connect();
++        return {
++          async query(sql, params) {
++            const result = await client.query(sql, params);
++            if (/ORDER BY profile_id FOR UPDATE/.test(sql) && ++selections === 1) { entered(); await gate; }
++            return result;
++          }, release: client.release.bind(client)
++        };
++      }
++    } });
++    const migration = createSaveService({ saveStore: paused }).mergeProfiles({ primaryProfileId: "race-primary", secondaryProfileId: "race-secondary", nowSeconds: 200 });
++    await selected;
++    try {
++      await createSaveService({ saveStore: b }).syncSave({ gameId: "game", profileId: "race-primary", clientEnvelope: envelope("race-primary", { high_score: 900, primary_flag: true }) });
++    } finally { resume(); }
++    await migration;
++    const raced = await a.get("game", "race-primary");
++    assert.ok(selections >= 2, "destination race must rollback and retry from fresh rows");
++    assert.equal(raced.payload.high_score, 900); assert.equal(raced.payload.games_played, 13);
++    assert.equal(raced.payload.primary_flag, true); assert.equal(raced.payload.secondary_flag, true);
++    assert.equal(await a.get("game", "race-secondary"), null);
+   } finally {
+     if (pool) await pool.end();
+     try { if (created) await admin.query(`DROP SCHEMA ${schema} CASCADE`); }
+diff --git a/tools/test-helpers/localPostgresUrl.js b/tools/test-helpers/localPostgresUrl.js
+new file mode 100644
+index 0000000..2beb791
+--- /dev/null
++++ b/tools/test-helpers/localPostgresUrl.js
+@@ -0,0 +1,13 @@
++// Never fall back to DATABASE_URL. A non-loopback hostname is accepted only for
++// the exact synthetic, internal-only Compose fixture and its explicit marker.
++export const COMPOSE_TEST_DATABASE_URL = 'postgresql://terapixel_test:synthetic-local-only@postgres:5432/terapixel_test';
++export function localPostgresUrl(raw, env = process.env) {
++  const url = new URL(raw);
++  if (!['postgres:', 'postgresql:'].includes(url.protocol) || url.search || url.hash) {
++    throw new Error('invalid integration database URL/overrides');
++  }
++  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
++  const compose = env.TPX_ISOLATED_COMPOSE_TEST === '1' && raw === COMPOSE_TEST_DATABASE_URL;
++  if (!loopback && !compose) throw new Error('integration DB must be loopback or the exact isolated Compose fixture');
++  return url;
++}
+-- 
+2.39.3 (Apple Git-145)
+
+From 9d964bc32f2fae034726bc07e88376a55cadb848 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Wed, 21 Oct 2026 09:49:20 -0500
+Subject: [PATCH] Include current-main workflow regression inputs in isolated
+ test runner
+
+---
+ infra/testing/Dockerfile              | 2 ++
+ infra/testing/Dockerfile.dockerignore | 6 ++++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/infra/testing/Dockerfile b/infra/testing/Dockerfile
+index 39f7b15..14473e4 100644
+--- a/infra/testing/Dockerfile
++++ b/infra/testing/Dockerfile
+@@ -1,5 +1,7 @@
+ FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
+ WORKDIR /app
++# Current-main workflow regression tests invoke Python JSON checks and mock CLIs.
++RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+ COPY package.json package-lock.json ./
+ RUN npm ci --ignore-scripts --no-audit --no-fund && npm cache clean --force
+ COPY --chown=node:node . .
+diff --git a/infra/testing/Dockerfile.dockerignore b/infra/testing/Dockerfile.dockerignore
+index fa73003..7708ee6 100644
+--- a/infra/testing/Dockerfile.dockerignore
++++ b/infra/testing/Dockerfile.dockerignore
+@@ -16,3 +16,9 @@
+ !infra/sql-migrations/**
+ !infra/testing/
+ !infra/testing/**
++!.github/
++!.github/workflows/
++!.github/workflows/*.yml
++!scripts/
++!scripts/cloudrun/
++!scripts/cloudrun/deploy-identity-staging.sh
+-- 
+2.39.3 (Apple Git-145)
+
+From 2eef249f455eb54b5ab9691bc313d4666e494fae Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Wed, 21 Oct 2026 09:50:52 -0500
+Subject: [PATCH] Run mocked CLI fixtures through interpreter on noexec test
+ tmpfs
+
+---
+ test/gateway-staging-workflow.test.js | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/test/gateway-staging-workflow.test.js b/test/gateway-staging-workflow.test.js
+index 8494cf6..946ee38 100644
+--- a/test/gateway-staging-workflow.test.js
++++ b/test/gateway-staging-workflow.test.js
+@@ -16,7 +16,7 @@ it('workflow is manual, main-only, fixed staging and uses full action SHAs',asyn
+ });
+ for(const failure of [null,'metadata','smoke'])it(`targeted release ${failure||'success'} preserves safety boundary (mock CLI)`,async()=>{
+  const dir=await fs.mkdtemp(path.join(os.tmpdir(),'gateway-release-test-'));const bin=path.join(dir,'bin');await fs.mkdir(bin);
+- const env={...process.env,PATH:bin+':'+process.env.PATH,RUNNER_TEMP:dir,GITHUB_REF:'refs/heads/main',GITHUB_SHA:'a'.repeat(40),GATEWAY_IMAGE:image,GITHUB_STEP_SUMMARY:path.join(dir,'summary'),MOCK_DIR:dir,MOCK_FAILURE:failure||''};
++ const env={...process.env,PATH:bin+':'+process.env.PATH,RUNNER_TEMP:dir,GITHUB_REF:'refs/heads/main',GITHUB_SHA:'a'.repeat(40),GATEWAY_IMAGE:image,GITHUB_STEP_SUMMARY:path.join(dir,'summary'),MOCK_DIR:dir,MOCK_SCRIPT:script.pathname,MOCK_FAILURE:failure||''};
+  const mock=`#!/usr/bin/env python3
+ import os,sys,json,pathlib
+ p=pathlib.Path(os.environ['MOCK_DIR']);a=sys.argv[1:]
+@@ -49,8 +49,11 @@ if (p/'promoted').exists() and os.environ['MOCK_FAILURE']=='smoke' and url.endsw
+ pathlib.Path(out).write_text(json.dumps(body));print(code,end='')
+ `;
+  try{
+-  await fs.writeFile(path.join(bin,'gcloud'),mock,{mode:0o700});await fs.writeFile(path.join(bin,'curl'),curl,{mode:0o700});
+-  const run=spawnSync('bash',[script.pathname],{env,encoding:'utf8'});
++  // Read fixtures through the interpreter: /tmp is deliberately noexec in the
++  // isolated runner. No executable temp files or relaxed mount flags are needed.
++  await fs.writeFile(path.join(dir,'gcloud.py'),mock);await fs.writeFile(path.join(dir,'curl.py'),curl);
++  await fs.writeFile(path.join(dir,'shims'), 'gcloud() { python3 "$MOCK_DIR/gcloud.py" "$@"; }\ncurl() { python3 "$MOCK_DIR/curl.py" "$@"; }\n');
++  const run=spawnSync('bash',['-c','source "$MOCK_DIR/shims"; source "$MOCK_SCRIPT"'],{env,encoding:'utf8'});
+   assert.equal(run.status===0,failure===null,run.stderr);
+   const calls=(await fs.readFile(path.join(dir,'calls'),'utf8')).trim().split('\n').map(JSON.parse);
+   assert.equal(calls.filter(x=>x[2]==='update').length,1);assert.equal(calls.filter(x=>x[2]==='update-traffic').length,failure==='metadata'?0:1);
+-- 
+2.39.3 (Apple Git-145)
+
+From d6871bbda5a3a6a925b4348f0eb64a1819d67596 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Wed, 21 Oct 2026 09:51:56 -0500
+Subject: [PATCH] Allow explicit pinned Node runtime matrix for local
+ PostgreSQL validation
+
+---
+ compose.test.yaml        | 2 ++
+ infra/testing/Dockerfile | 3 ++-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/compose.test.yaml b/compose.test.yaml
+index 1154b71..62a91dd 100644
+--- a/compose.test.yaml
++++ b/compose.test.yaml
+@@ -18,6 +18,8 @@ services:
+     build:
+       context: .
+       dockerfile: infra/testing/Dockerfile
++      args:
++        TEST_NODE_IMAGE: "${TEST_NODE_IMAGE:-node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392}"
+     depends_on:
+       postgres:
+         condition: service_healthy
+diff --git a/infra/testing/Dockerfile b/infra/testing/Dockerfile
+index 14473e4..d262392 100644
+--- a/infra/testing/Dockerfile
++++ b/infra/testing/Dockerfile
+@@ -1,4 +1,5 @@
+-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
++ARG TEST_NODE_IMAGE=node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392
++FROM ${TEST_NODE_IMAGE}
+ WORKDIR /app
+ # Current-main workflow regression tests invoke Python JSON checks and mock CLIs.
+ RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
+-- 
+2.39.3 (Apple Git-145)
+

@@ -1,0 +1,932 @@
+From 6c086b965a45e4489aed8f4f00fefe628da1d5d0 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 14:04:28 -0500
+Subject: [PATCH] Use authoritative subscription time and captured payments;
+ disable unverified webhooks
+
+---
+ services/iap-service/README.md                |  80 +++++++++
+ services/iap-service/src/httpServer.js        |  40 ++---
+ services/iap-service/src/iapService.js        | 100 ++++++-----
+ .../src/providers/appleProvider.js            |  21 ++-
+ .../src/providers/googleProvider.js           |  41 +++--
+ .../src/providers/paypalProvider.js           |  98 +++++------
+ test/iap-lifecycle-http.test.js               |  81 +++++++++
+ test/iap-lifecycle.test.js                    | 165 ++++++++++++++++++
+ 8 files changed, 483 insertions(+), 143 deletions(-)
+ create mode 100644 test/iap-lifecycle-http.test.js
+ create mode 100644 test/iap-lifecycle.test.js
+
+diff --git a/services/iap-service/README.md b/services/iap-service/README.md
+index 9016c5a..34c314e 100644
+--- a/services/iap-service/README.md
++++ b/services/iap-service/README.md
+@@ -103,3 +103,83 @@ Validation:
+ 
+ No database/server, credentials, or live settings are provisioned by these changes.
+ Review and merge this independent patch to main before staging or production.
++
++## Billing lifecycle hardening (stacked on atomic wallet writes)
++
++Verification time comes from the service clock (`Date.now` by default). Tests may
++inject `clock: () => unixSeconds` at service construction; request `now_seconds`,
++`nowSeconds` and `expires_at` cannot override provider verification time or the
++expiry returned by the Apple/Google adapters. Entitlement reads require both a
++provider-active value and a valid future expiry. At exactly the expiry second,
++`no_ads.active` becomes false without a new verification request. Historical
++active subscriptions lacking a valid expiry now fail closed and require an
++authorized provider reconciliation; they are not granted indefinite access.
++
++PayPal's Orders adapter supports only the existing single-unit consumable flow:
++a `COMPLETED` order containing one `COMPLETED` capture, with both order-unit and
++capture amounts/currencies matching the catalog. `APPROVED`, authorizations,
++pending/absent captures, partial/multiple captures and multi-unit orders are not
++accepted. The existing order-ID transaction key is retained to avoid regranting
++previously fulfilled orders under a new capture-ID namespace. Prices currently
++use the catalog's two-decimal currency representation (the shipped catalog is
++USD); other currency precision models need a separate implementation.
++
++PayPal subscriptions are deliberately unsupported by this Orders adapter. A
++client-provided expiry is never authoritative. Proper support requires the
++Subscriptions API, a server-owned product/plan/account association and verified
++billing-period/payment data; no duration is invented from a completed order.
++Apple verification requires a matching receipt product and valid subscription
++expiry, selecting the newest matching receipt line. Google checks the matching
++subscription line, valid expiry and provider state: active, grace-period and
++canceled-but-unexpired states may retain access; pending/paused/on-hold states do
++not. Neither provider accepts client clock/expiry as entitlement authority.
++Malformed HTTP request/payload shapes return 400; provider verification rejection
++returns 422. Storage/server failures remain 500 and must not be classified as a
++successful purchase.
++
++### Webhooks are disabled, not fully integrated
++
++All three webhook endpoints return 503 `webhook_not_configured` for valid JSON.
++Malformed JSON/shapes return 400. The prior allow-all signature stub and broken
++arrow-`this` purchase dispatch are removed. Neither signature-looking headers,
++client profile/product fields, nor a native-looking provider envelope enables
++processing. No signature verification is claimed by this implementation.
++
++Before enabling events, implement and review native verification plus durable,
++server-owned account/product association, replay/out-of-order handling and
++reconciliation:
++
++- Apple: verified signed App Store Server Notifications and app/environment
++  binding, with transaction/subscription association to a platform account.
++- Google: authenticated Pub/Sub push with the expected identity/audience,
++  notification decoding and an authoritative Play Developer API lookup with
++  package/product/account binding.
++- PayPal: native webhook verification for the configured webhook identity and
++  transmission data, followed by trusted merchant/order/subscription/account
++  mapping. The legacy profile_id/product_id wrapper is not a native provider
++  event contract and must not be trusted.
++
++Renewals, refunds, revocations, missed-event replay and reconciliation are not
++implemented here. Existing same-transaction deduplication does not update a
++subscription on a later state change with the same transaction ID. Expiry checks
++alone do not handle early revocation. Do not enable or expand live payments on
++the basis of these mocks. Review app/package, merchant, product and account
++binding and existing grants before rollout. Apple's legacy verifyReceipt API
++remains in use and is deprecated; migration is a separate integration task.
++
++Official contract references:
++
++- PayPal Orders/captures: https://developer.paypal.com/api/orders/v2
++- PayPal Subscriptions: https://developer.paypal.com/api/subscriptions/v1
++- PayPal webhook verification: https://developer.paypal.com/api/webhooks/v1/
++- Apple receipt API: https://developer.apple.com/documentation/appstorereceipts/verify-receipt
++- Apple notifications: https://developer.apple.com/documentation/appstoreservernotifications/receiving-app-store-server-notifications
++- Google subscription resource/states: https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptionsv2
++- Google authenticated push: https://docs.cloud.google.com/pubsub/docs/authenticate-push-subscriptions
++
++Validation uses provider HTTP/OAuth test doubles and local HTTP routes. It does
++not exercise live provider verification or real webhook signatures. The real
++PostgreSQL integration test remains unexecuted and is a release gate. No new
++credentials, secrets, provider settings, deployments or system services are
++created/configured. Publication waits for authorized GitHub authentication;
++reviewed main commits must precede staging, then production.
+diff --git a/services/iap-service/src/httpServer.js b/services/iap-service/src/httpServer.js
+index 32ea1d6..2a6eec1 100644
+--- a/services/iap-service/src/httpServer.js
++++ b/services/iap-service/src/httpServer.js
+@@ -1,5 +1,6 @@
+ import http from "node:http";
+ import crypto from "node:crypto";
++import { PurchaseVerificationError, WebhookUnavailableError } from "./iapService.js";
+ import {
+   JwtValidationError,
+   createSessionTokenVerifier
+@@ -66,6 +67,12 @@ export function createIapHttpServer(options = {}) {
+         requestId
+       });
+     } catch (error) {
++      if (error instanceof PurchaseVerificationError) {
++        error = new HttpError(422, "purchase_rejected", error.message);
++      }
++      if (error instanceof WebhookUnavailableError) {
++        error = new HttpError(503, "webhook_not_configured", error.message);
++      }
+       if (error instanceof HttpError) {
+         writeJson(res, error.statusCode, {
+           request_id: requestId,
+@@ -128,6 +135,11 @@ async function handleRequest(req, res, ctx) {
+     }
+     const body = await readJsonBody(req, ctx.bodyLimitBytes);
+     ensureObjectBody(body);
++    if (typeof body.provider !== "string" || !body.provider.trim() ||
++        typeof body.product_id !== "string" || !body.product_id.trim()) {
++      throw new HttpError(400, "invalid_request", "provider and product_id are required");
++    }
++    ensureObjectBody(body.payload);
+     const result = await ctx.service.verifyPurchase({
+       profileId,
+       provider: body.provider,
+@@ -168,18 +180,8 @@ async function handleRequest(req, res, ctx) {
+   if (req.method === "POST" && isWebhookPath(url.pathname)) {
+     const body = await readJsonBody(req, ctx.bodyLimitBytes);
+     ensureObjectBody(body);
+-  const provider = webhookProviderFromPath(url.pathname);
+-    await verifyWebhookSignatureStub(req, provider);
+-    const result = await ctx.service.applyWebhookEvent({
+-      provider,
+-      body: {
+-        ...body,
+-        export_target:
+-          body.export_target ||
+-          req.headers["x-export-target"] ||
+-          mapProviderToDefaultTarget(provider)
+-      }
+-    });
++    const provider = webhookProviderFromPath(url.pathname);
++    const result = await ctx.service.applyWebhookEvent({ provider, body });
+     writeJson(res, 202, {
+       request_id: ctx.requestId,
+       ...result
+@@ -286,20 +288,6 @@ function webhookProviderFromPath(pathname) {
+   return "paypal_web";
+ }
+ 
+-function mapProviderToDefaultTarget(provider) {
+-  if (provider === "apple") {
+-    return "ios";
+-  }
+-  if (provider === "google") {
+-    return "android";
+-  }
+-  return "web";
+-}
+-
+-async function verifyWebhookSignatureStub(_req, _provider) {
+-  return true;
+-}
+-
+ async function readJsonBody(req, bodyLimitBytes) {
+   const chunks = [];
+   let total = 0;
+diff --git a/services/iap-service/src/iapService.js b/services/iap-service/src/iapService.js
+index fb49cb0..66facb6 100644
+--- a/services/iap-service/src/iapService.js
++++ b/services/iap-service/src/iapService.js
+@@ -6,6 +6,13 @@ import { createNoopIapRuntimeConfigProvider } from "./runtimeConfigProvider.js";
+ 
+ export function createIapService(options = {}) {
+   const store = options.store || new InMemoryIapStore();
++  // Tests may inject server time at construction; requests never supply it.
++  const clock = options.clock || (() => Math.floor(Date.now() / 1000));
++  const now = () => {
++    const value = clock();
++    if (!Number.isFinite(value) || value <= 0) throw new Error("invalid server clock");
++    return Math.floor(value);
++  };
+   const baseCatalog = createCatalog(options.catalog || {});
+   const providers =
+     options.providerRegistry || createProviderRegistry(options.providers || {});
+@@ -18,7 +25,7 @@ export function createIapService(options = {}) {
+     ]);
+     return {
+       profile_id: profileId,
+-      no_ads: normalizeSubscription(noAds),
++      no_ads: normalizeSubscription(noAds, now()),
+       coins
+     };
+   };
+@@ -49,17 +56,23 @@ export function createIapService(options = {}) {
+       const runtimeCatalog = normalizeObject(runtimeConfig?.iapCatalog);
+       const catalog = mergeCatalog(baseCatalog, runtimeCatalog);
+       const iapProviderConfigs = normalizeObject(runtimeConfig?.iapProviderConfigs);
+-      const normalized = await normalizePurchase({
+-        profileId,
+-        provider,
+-        productId,
+-        payload,
+-        catalog,
+-        exportTarget,
+-        providers,
+-        gameId: normalizedGameId,
+-        iapProviderConfigs
+-      });
++      let normalized;
++      try {
++        normalized = await normalizePurchase({
++          profileId,
++          provider,
++          productId,
++          payload,
++          catalog,
++          exportTarget,
++          providers,
++          gameId: normalizedGameId,
++          iapProviderConfigs,
++          nowSeconds: now()
++        });
++      } catch (error) {
++        throw new PurchaseVerificationError(error.message);
++      }
+       const dedupe = await store.applyTransaction(
+         normalized.provider,
+         normalized.externalTransactionId,
+@@ -91,22 +104,12 @@ export function createIapService(options = {}) {
+         entitlements
+       };
+     },
+-    applyWebhookEvent: async ({ provider, body }) => {
+-      const normalizedBody = body && typeof body === "object" ? body : {};
+-      const profileId = String(normalizedBody.profile_id || "").trim();
+-      const productId = String(normalizedBody.product_id || "").trim();
+-      const exportTarget = String(normalizedBody.export_target || "").trim();
+-      if (!profileId || !productId) {
+-        throw new Error("webhook payload requires profile_id and product_id");
+-      }
+-      return this.verifyPurchase({
+-        profileId,
+-        provider,
+-        productId,
+-        exportTarget,
+-        gameId: normalizedBody.game_id || "",
+-        payload: normalizedBody.payload || normalizedBody
+-      });
++    applyWebhookEvent: async ({ provider }) => {
++      normalizeProvider(provider);
++      // Native provider notifications require authenticated envelopes and a
++      // server-owned account/product mapping. No verified adapter exists yet.
++      // Reject explicitly instead of calling an arrow function's lexical `this`.
++      throw new WebhookUnavailableError();
+     },
+     mergeProfiles: async ({ primaryProfileId, secondaryProfileId }) => {
+       assertRequiredString(primaryProfileId, "primaryProfileId");
+@@ -181,13 +184,16 @@ async function normalizePurchase(input) {
+   }
+   const target = normalizeExportTarget(input.exportTarget || input.payload?.export_target);
+   enforceProviderForTarget(provider, target);
+-  const payload = input.payload && typeof input.payload === "object" ? input.payload : {};
++  if (!input.payload || typeof input.payload !== "object" || Array.isArray(input.payload)) {
++    throw new Error("payload must be an object");
++  }
++  const payload = input.payload;
+   const verified = await input.providers.verifyPurchase({
+     provider,
+     productId,
+     payload,
+     catalogEntry,
+-    nowSeconds: payload.now_seconds,
++    nowSeconds: input.nowSeconds,
+     providerConfig: resolveProviderConfig(input.iapProviderConfigs, provider),
+     gameId: expectedGameId
+   });
+@@ -267,23 +273,37 @@ function normalizeObject(value) {
+   return value;
+ }
+ 
+-function normalizeSubscription(sub) {
+-  const active = Boolean(sub?.active);
+-  const status = String(sub?.status || (active ? "active" : "none"));
++function normalizeSubscription(sub, nowSeconds) {
+   const expires = Number(sub?.expiresAt);
+-  if (Number.isFinite(expires) && expires > 0) {
+-    return {
+-      active,
+-      status,
+-      expires_at: Math.floor(expires)
+-    };
++  const validExpiry = Number.isFinite(expires) && expires > 0;
++  const active = sub?.active === true && validExpiry && expires > nowSeconds;
++  let status = String(sub?.status || (sub?.active === true ? "active" : "none"));
++  if (validExpiry && expires <= nowSeconds && (sub?.active === true || status === "active")) {
++    status = "expired";
++  } else if (!validExpiry && sub?.active === true) {
++    status = "invalid_expiry";
+   }
+   return {
+     active,
+-    status
++    status,
++    ...(validExpiry ? { expires_at: Math.floor(expires) } : {})
+   };
+ }
+ 
++export class PurchaseVerificationError extends Error {
++  constructor(message) {
++    super(message);
++    this.name = "PurchaseVerificationError";
++  }
++}
++
++export class WebhookUnavailableError extends Error {
++  constructor() {
++    super("Verified provider webhook processing is not configured");
++    this.name = "WebhookUnavailableError";
++  }
++}
++
+ function normalizeProvider(provider) {
+   const normalized = String(provider || "").trim().toLowerCase();
+   if (!normalized) {
+diff --git a/services/iap-service/src/providers/appleProvider.js b/services/iap-service/src/providers/appleProvider.js
+index f16c307..31f240f 100644
+--- a/services/iap-service/src/providers/appleProvider.js
++++ b/services/iap-service/src/providers/appleProvider.js
+@@ -1,4 +1,5 @@
+ export function createAppleProvider(options = {}) {
++  const fetchImpl = options.fetch || fetch;
+   const sharedSecret = String(options.sharedSecret || "");
+   const productionUrl =
+     String(options.productionUrl || "").trim() ||
+@@ -9,7 +10,8 @@ export function createAppleProvider(options = {}) {
+ 
+   return {
+     verifyPurchase: async ({ provider, productId, payload, catalogEntry, nowSeconds }) => {
+-      const receiptData = String(payload?.receipt_data || payload?.receiptData || "").trim();
++      const rawReceipt = payload?.receipt_data || payload?.receiptData;
++      const receiptData = typeof rawReceipt === "string" ? rawReceipt.trim() : "";
+       if (!receiptData) {
+         throw new Error("apple payload.receipt_data is required");
+       }
+@@ -18,10 +20,10 @@ export function createAppleProvider(options = {}) {
+         password: sharedSecret || undefined,
+         "exclude-old-transactions": true
+       };
+-      let response = await postJson(productionUrl, requestBody);
++      let response = await postJson(productionUrl, requestBody, fetchImpl);
+       // Apple status 21007 means sandbox receipt sent to production.
+       if (Number(response?.status) === 21007) {
+-        response = await postJson(sandboxUrl, requestBody);
++        response = await postJson(sandboxUrl, requestBody, fetchImpl);
+       }
+       if (Number(response?.status) !== 0) {
+         throw new Error(`apple receipt rejected (status=${response?.status})`);
+@@ -48,6 +50,9 @@ export function createAppleProvider(options = {}) {
+         };
+       }
+       const expiresAt = Math.floor(Number(line.expires_date_ms || 0) / 1000);
++      if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
++        throw new Error("apple subscription missing valid expiry");
++      }
+       const active = expiresAt > now;
+       return {
+         provider,
+@@ -74,6 +79,10 @@ function pickAppleReceiptLine(response, productId) {
+   const inApp = Array.isArray(response?.receipt?.in_app) ? response.receipt.in_app : [];
+   const merged = [...latest, ...inApp];
+   const target = String(productId || "").trim().toLowerCase();
++  merged.sort((a, b) =>
++    Number(b?.expires_date_ms || b?.purchase_date_ms || 0) -
++    Number(a?.expires_date_ms || a?.purchase_date_ms || 0)
++  );
+   for (const row of merged) {
+     if (!row || typeof row !== "object") {
+       continue;
+@@ -82,11 +91,11 @@ function pickAppleReceiptLine(response, productId) {
+       return row;
+     }
+   }
+-  return merged[0] || null;
++  return null;
+ }
+ 
+-async function postJson(url, body) {
+-  const response = await fetch(url, {
++async function postJson(url, body, fetchImpl) {
++  const response = await fetchImpl(url, {
+     method: "POST",
+     headers: {
+       "content-type": "application/json"
+diff --git a/services/iap-service/src/providers/googleProvider.js b/services/iap-service/src/providers/googleProvider.js
+index 06b1fa4..713dd93 100644
+--- a/services/iap-service/src/providers/googleProvider.js
++++ b/services/iap-service/src/providers/googleProvider.js
+@@ -1,6 +1,7 @@
+ import crypto from "node:crypto";
+ 
+ export function createGooglePlayProvider(options = {}) {
++  const fetchImpl = options.fetch || fetch;
+   const clientEmail = String(options.clientEmail || "");
+   const privateKey = normalizePrivateKey(options.privateKey || "");
+   const tokenUrl =
+@@ -12,10 +13,10 @@ export function createGooglePlayProvider(options = {}) {
+ 
+   return {
+     verifyPurchase: async ({ provider, productId, payload, catalogEntry, nowSeconds }) => {
+-      const packageName = String(payload?.package_name || payload?.packageName || "").trim();
+-      const purchaseToken = String(
+-        payload?.purchase_token || payload?.purchaseToken || ""
+-      ).trim();
++      const rawPackage = payload?.package_name || payload?.packageName;
++      const rawToken = payload?.purchase_token || payload?.purchaseToken;
++      const packageName = typeof rawPackage === "string" ? rawPackage.trim() : "";
++      const purchaseToken = typeof rawToken === "string" ? rawToken.trim() : "";
+       if (!packageName || !purchaseToken) {
+         throw new Error("google payload.package_name and payload.purchase_token are required");
+       }
+@@ -26,7 +27,8 @@ export function createGooglePlayProvider(options = {}) {
+         clientEmail,
+         privateKey,
+         tokenUrl,
+-        scope
++        scope,
++        fetchImpl
+       });
+ 
+       if (catalogEntry.type === "consumable") {
+@@ -35,8 +37,8 @@ export function createGooglePlayProvider(options = {}) {
+         )}/purchases/products/${encodeURIComponent(productId)}/tokens/${encodeURIComponent(
+           purchaseToken
+         )}`;
+-        const purchase = await getJson(url, accessToken);
+-        const state = Number(purchase.purchaseState || 0);
++        const purchase = await getJson(url, accessToken, fetchImpl);
++        const state = purchase.purchaseState;
+         if (state !== 0) {
+           throw new Error(`google purchase not completed (purchaseState=${state})`);
+         }
+@@ -55,12 +57,23 @@ export function createGooglePlayProvider(options = {}) {
+       const url = `${apiBase}/${encodeURIComponent(
+         packageName
+       )}/purchases/subscriptionsv2/tokens/${encodeURIComponent(purchaseToken)}`;
+-      const sub = await getJson(url, accessToken);
+-      const latestLine = Array.isArray(sub.lineItems) ? sub.lineItems[0] || {} : {};
++      const sub = await getJson(url, accessToken, fetchImpl);
++      const lines = Array.isArray(sub.lineItems)
++        ? sub.lineItems.filter((line) => line?.productId === productId)
++        : [];
++      lines.sort((a, b) => Date.parse(b.expiryTime) - Date.parse(a.expiryTime));
++      const latestLine = lines[0];
++      if (!latestLine) throw new Error("google subscription missing matching product");
+       const expiry = Date.parse(String(latestLine.expiryTime || ""));
+       const expiresAt = Number.isFinite(expiry) ? Math.floor(expiry / 1000) : 0;
++      if (expiresAt <= 0) throw new Error("google subscription missing valid expiry");
+       const now = normalizeNow(nowSeconds);
+-      const active = expiresAt > now;
++      const state = String(sub.subscriptionState || "");
++      if (!state || state === "SUBSCRIPTION_STATE_UNSPECIFIED") {
++        throw new Error("google subscription missing state");
++      }
++      const entitledStates = ["SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD", "SUBSCRIPTION_STATE_CANCELED"];
++      const active = entitledStates.includes(state) && expiresAt > now;
+       return {
+         provider,
+         externalTransactionId: String(
+@@ -72,7 +85,7 @@ export function createGooglePlayProvider(options = {}) {
+         subscription: {
+           provider,
+           externalSubscriptionId: String(sub.latestOrderId || purchaseToken),
+-          status: active ? "active" : "expired",
++          status: expiresAt <= now ? "expired" : state.replace("SUBSCRIPTION_STATE_", "").toLowerCase(),
+           active,
+           expiresAt: expiresAt > 0 ? expiresAt : undefined
+         }
+@@ -94,7 +107,7 @@ async function createGoogleAccessToken(config) {
+     grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+     assertion
+   });
+-  const response = await fetch(config.tokenUrl, {
++  const response = await config.fetchImpl(config.tokenUrl, {
+     method: "POST",
+     headers: {
+       "content-type": "application/x-www-form-urlencoded"
+@@ -129,8 +142,8 @@ function signServiceAccountJwt(input) {
+   return `${unsigned}.${base64UrlBuffer(signature)}`;
+ }
+ 
+-async function getJson(url, accessToken) {
+-  const response = await fetch(url, {
++async function getJson(url, accessToken, fetchImpl) {
++  const response = await fetchImpl(url, {
+     method: "GET",
+     headers: {
+       authorization: `Bearer ${accessToken}`
+diff --git a/services/iap-service/src/providers/paypalProvider.js b/services/iap-service/src/providers/paypalProvider.js
+index 30063c6..ddb65d1 100644
+--- a/services/iap-service/src/providers/paypalProvider.js
++++ b/services/iap-service/src/providers/paypalProvider.js
+@@ -1,12 +1,17 @@
+ export function createPaypalWebProvider(options = {}) {
++  const fetchImpl = options.fetch || fetch;
+   const defaultClientId = String(options.clientId || "");
+   const defaultClientSecret = String(options.clientSecret || "");
+   const defaultBaseUrl =
+     String(options.baseUrl || "").trim() || "https://api-m.paypal.com";
+ 
+   return {
+-    verifyPurchase: async ({ provider, payload, catalogEntry, nowSeconds, providerConfig }) => {
+-      const orderId = String(payload?.order_id || payload?.orderId || "").trim();
++    verifyPurchase: async ({ provider, payload, catalogEntry, providerConfig }) => {
++      if (catalogEntry?.type !== "consumable") {
++        throw new Error("PayPal subscription verification is not supported");
++      }
++      const rawOrderId = payload?.order_id || payload?.orderId;
++      const orderId = typeof rawOrderId === "string" ? rawOrderId.trim() : "";
+       if (!orderId) {
+         throw new Error("paypal payload.order_id is required");
+       }
+@@ -23,76 +28,62 @@ export function createPaypalWebProvider(options = {}) {
+       const token = await getPaypalAccessToken(
+         `${effectiveBaseUrl}/v1/oauth2/token`,
+         effectiveClientId,
+-        effectiveClientSecret
++        effectiveClientSecret,
++        fetchImpl
+       );
+       const order = await getJson(
+         `${effectiveBaseUrl}/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+-        token
++        token,
++        fetchImpl
+       );
+       const status = String(order?.status || "").toUpperCase();
+-      if (!["COMPLETED", "APPROVED"].includes(status)) {
++      if (status !== "COMPLETED") {
+         throw new Error(`paypal order not complete (status=${status || "unknown"})`);
+       }
++      if (order.id !== orderId) throw new Error("paypal order ID mismatch");
+       assertOrderMatchesCatalog(order, catalogEntry);
+ 
+-      if (catalogEntry.type === "consumable") {
+-        return {
+-          provider,
+-          externalTransactionId: orderId,
+-          type: "consumable",
+-          gameId: catalogEntry.gameId,
+-          coinsDelta: Number(catalogEntry.coins) || 0,
+-          subscription: null
+-        };
+-      }
+-      const expiresAt = Number(payload?.expires_at || 0);
+-      const now = normalizeNow(nowSeconds);
+-      const active = Number.isFinite(expiresAt) ? expiresAt > now : true;
+       return {
+         provider,
+         externalTransactionId: orderId,
+-        type: "subscription",
+-        gameId: "",
+-        coinsDelta: 0,
+-        subscription: {
+-          provider,
+-          externalSubscriptionId: orderId,
+-          status: active ? "active" : "expired",
+-          active,
+-          expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? Math.floor(expiresAt) : undefined
+-        }
++        type: "consumable",
++        gameId: catalogEntry.gameId,
++        coinsDelta: Number(catalogEntry.coins) || 0,
++        subscription: null
+       };
+     }
+   };
+ }
+ 
+ function assertOrderMatchesCatalog(order, catalogEntry) {
+-  const expectedPrice = Number(catalogEntry?.price || 0);
+-  const expectedCurrency = String(catalogEntry?.currency || "").trim().toUpperCase();
+-  const unit = order?.purchase_units?.[0] || {};
+-  const amount = unit?.amount || {};
+-  const orderValue = Number(amount?.value || 0);
+-  const orderCurrency = String(amount?.currency_code || "").trim().toUpperCase();
+-
+-  if (expectedCurrency && orderCurrency && expectedCurrency !== orderCurrency) {
+-    throw new Error(
+-      `paypal currency mismatch (expected=${expectedCurrency}, actual=${orderCurrency})`
+-    );
++  const units = order.purchase_units;
++  if (!Array.isArray(units) || units.length !== 1) {
++    throw new Error("paypal requires one fully captured purchase unit");
+   }
++  const captures = units[0]?.payments?.captures;
++  if (!Array.isArray(captures) || captures.length !== 1 ||
++      !captures[0]?.id || captures[0].status !== "COMPLETED") {
++    throw new Error("paypal completed capture is required");
++  }
++  assertAmount(units[0].amount, catalogEntry);
++  assertAmount(captures[0].amount, catalogEntry);
++}
+ 
+-  if (expectedPrice > 0 && Number.isFinite(orderValue)) {
+-    const delta = Math.abs(expectedPrice - orderValue);
+-    if (delta > 0.01) {
+-      throw new Error(
+-        `paypal amount mismatch (expected=${expectedPrice.toFixed(2)}, actual=${orderValue.toFixed(2)})`
+-      );
+-    }
++function assertAmount(amount, catalogEntry) {
++  const expected = Number(catalogEntry.price);
++  const currency = String(catalogEntry.currency || "").trim().toUpperCase();
++  const value = amount?.value;
++  if (!Number.isFinite(expected) || expected <= 0 || !currency ||
++      typeof value !== "string" || !/^\d+(?:\.\d{1,2})?$/.test(value) ||
++      amount.currency_code !== currency ||
++      Math.round(Number(value) * 100) !== Math.round(expected * 100)) {
++    throw new Error("paypal captured amount/currency does not match catalog");
+   }
+ }
+ 
+-async function getPaypalAccessToken(tokenUrl, clientId, clientSecret) {
++async function getPaypalAccessToken(tokenUrl, clientId, clientSecret, fetchImpl) {
+   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+-  const response = await fetch(tokenUrl, {
++  const response = await fetchImpl(tokenUrl, {
+     method: "POST",
+     headers: {
+       authorization: `Basic ${basic}`,
+@@ -107,8 +98,8 @@ async function getPaypalAccessToken(tokenUrl, clientId, clientSecret) {
+   return String(json.access_token);
+ }
+ 
+-async function getJson(url, accessToken) {
+-  const response = await fetch(url, {
++async function getJson(url, accessToken, fetchImpl) {
++  const response = await fetchImpl(url, {
+     method: "GET",
+     headers: {
+       authorization: `Bearer ${accessToken}`
+@@ -120,10 +111,3 @@ async function getJson(url, accessToken) {
+   }
+   return json;
+ }
+-
+-function normalizeNow(nowSeconds) {
+-  if (Number.isFinite(Number(nowSeconds)) && Number(nowSeconds) > 0) {
+-    return Math.floor(Number(nowSeconds));
+-  }
+-  return Math.floor(Date.now() / 1000);
+-}
+diff --git a/test/iap-lifecycle-http.test.js b/test/iap-lifecycle-http.test.js
+new file mode 100644
+index 0000000..98c53ac
+--- /dev/null
++++ b/test/iap-lifecycle-http.test.js
+@@ -0,0 +1,81 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { createIapService, createIapHttpServer } from "../services/iap-service/index.js";
++import { createSessionToken } from "../packages/shared-utils/index.js";
++const now = 1_800_000_000;
++async function withServer(run) {
++  let clock = now;
++  let orderStatus = "APPROVED";
++  const secret = "test-iap-http-session-secret";
++  const service = createIapService({ clock: () => clock, providers: {
++    apple: { fetch: async () => new Response(JSON.stringify({ status: 0, latest_receipt_info: [{ product_id: "no_ads_monthly", transaction_id: "receipt-tx", expires_date_ms: String((now + 1) * 1000) }] })) },
++    paypal: { clientId: "test-client", clientSecret: "test-secret", fetch: async (url) => new Response(JSON.stringify(url.endsWith("/token") ? { access_token: "test-token" } : {
++      id: "ORDER-1", status: orderStatus, purchase_units: [{ amount: { value: "0.99", currency_code: "USD" }, payments: { captures: [{ id: "CAPTURE-1", status: "COMPLETED", amount: { value: "0.99", currency_code: "USD" } }] } }]
++    })) }
++  } });
++  const server = createIapHttpServer({ service, sessionSecret: secret });
++  const { baseUrl } = await server.listen();
++  const token = createSessionToken({ sub: "player" }, secret, { ttlSeconds: 600 });
++  const headers = { "content-type": "application/json", authorization: `Bearer ${token}` };
++  const post = (path, body, extra = {}) => fetch(`${baseUrl}${path}`, { method: "POST", headers: { ...headers, ...extra }, body: JSON.stringify(body) });
++  try { await run({ baseUrl, service, post, headers, advance: () => clock++, capture: () => { orderStatus = "COMPLETED"; } }); }
++  finally { await server.close(); }
++}
++describe("IAP lifecycle routes", () => {
++  it("uses server expiry on verification/read despite request time and expiry fields", () => withServer(async ({ baseUrl, post, headers, advance }) => {
++    const request = { provider: "apple", product_id: "no_ads_monthly", export_target: "ios", nowSeconds: 1, payload: { receipt_data: "test-receipt", now_seconds: 1, expires_at: now + 999999 } };
++    const response = await post("/v1/iap/verify", request);
++    assert.equal(response.status, 200);
++    assert.equal((await response.json()).entitlements.no_ads.active, true);
++    advance();
++    const read = await fetch(`${baseUrl}/v1/iap/entitlements?now_seconds=1`, { headers });
++    assert.equal(read.status, 200);
++    assert.equal((await read.json()).no_ads.active, false);
++    const retry = await post("/v1/iap/verify", request);
++    assert.equal(retry.status, 200);
++    const result = await retry.json();
++    assert.equal(result.deduplicated, true);
++    assert.equal(result.entitlements.no_ads.active, false);
++  }));
++  it("rejects approved-but-uncaptured PayPal without consuming the order key", () => withServer(async ({ post, capture, service }) => {
++    const request = { provider: "paypal_web", product_id: "coins_500_lumarush", export_target: "web", payload: { order_id: "ORDER-1" } };
++    const denied = await post("/v1/iap/verify", request);
++    assert.equal(denied.status, 422);
++    assert.equal((await denied.json()).error.code, "purchase_rejected");
++    assert.equal(service.store._transactions.size, 0);
++    capture();
++    const granted = await post("/v1/iap/verify", request);
++    assert.equal(granted.status, 200);
++    const result = await granted.json();
++    assert.equal(result.deduplicated, false);
++    assert.equal(result.entitlements.coins.lumarush.balance, 500);
++  }));
++  it("rejects client-supplied PayPal subscription expiry", () => withServer(async ({ post, service }) => {
++    const response = await post("/v1/iap/verify", { provider: "paypal_web", product_id: "no_ads_monthly", payload: { order_id: "ORDER-1", expires_at: now + 999999 } });
++    assert.equal(response.status, 422);
++    assert.equal(service.store._transactions.size, 0);
++  }));
++  it("fails closed for unsigned, signature-looking and native-envelope webhook bodies", () => withServer(async ({ post, service }) => {
++    for (const provider of ["apple", "google", "paypal"]) {
++      for (const body of [
++        { profile_id: "victim", product_id: "coins_500_lumarush", payload: { transaction_id: "forged" } },
++        { signedPayload: "not-a-valid-jws", message: { data: "not-a-valid-pubsub-payload" }, event_type: "PAYMENT.CAPTURE.COMPLETED" }
++      ]) {
++        const response = await post(`/v1/iap/webhook/${provider}`, body, { "paypal-transmission-sig": "invalid-signature", authorization: "Bearer invalid-push-jwt" });
++        assert.equal(response.status, 503);
++        assert.equal((await response.json()).error.code, "webhook_not_configured");
++      }
++    }
++    assert.equal(service.store._transactions.size, 0);
++    const { applyWebhookEvent } = service;
++    await assert.rejects(applyWebhookEvent({ provider: "apple", body: {} }), { name: "WebhookUnavailableError" });
++  }));
++  it("rejects malformed JSON/request/payload objects without grants", () => withServer(async ({ post, baseUrl, headers, service }) => {
++    for (const body of [null, [], {}, { provider: 42, product_id: "no_ads_monthly", payload: {} }, { provider: "apple", product_id: "no_ads_monthly", payload: [] }]) {
++      assert.equal((await post("/v1/iap/verify", body)).status, 400);
++    }
++    assert.equal((await fetch(`${baseUrl}/v1/iap/webhook/apple`, { method: "POST", headers, body: "{" })).status, 400);
++    assert.equal((await post("/v1/iap/webhook/google", [])).status, 400);
++    assert.equal(service.store._transactions.size, 0);
++  }));
++});
+diff --git a/test/iap-lifecycle.test.js b/test/iap-lifecycle.test.js
+new file mode 100644
+index 0000000..64ee808
+--- /dev/null
++++ b/test/iap-lifecycle.test.js
+@@ -0,0 +1,165 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import crypto from "node:crypto";
++import { createIapService, InMemoryIapStore } from "../services/iap-service/index.js";
++import { createAppleProvider } from "../services/iap-service/src/providers/appleProvider.js";
++import { createGooglePlayProvider } from "../services/iap-service/src/providers/googleProvider.js";
++import { createPaypalWebProvider } from "../services/iap-service/src/providers/paypalProvider.js";
++
++const now = 1_800_000_000;
++const json = (body, status = 200) => new Response(JSON.stringify(body), { status });
++const subRequest = { profileId: "player", provider: "apple", productId: "no_ads_monthly", exportTarget: "ios", payload: { receipt_data: "test-receipt", now_seconds: 1, expires_at: 9_000_000_000 } };
++function appleService(reply, clock = () => now) {
++  return createIapService({ clock, providers: { apple: { fetch: async () => json(reply) } } });
++}
++const receipt = (expires, product = "no_ads_monthly", id = "apple-tx") => ({ status: 0, latest_receipt_info: [{ product_id: product, transaction_id: id, original_transaction_id: "apple-sub", expires_date_ms: String(expires * 1000) }] });
++
++function paypalService(order, onFetch = () => {}) {
++  return createIapService({ clock: () => now, providers: { paypal: {
++    clientId: "test-client", clientSecret: "test-client-secret",
++    fetch: async (url) => {
++      onFetch(url);
++      return url.endsWith("/token") ? json({ access_token: "test-access-token" }) : json(order);
++    }
++  } } });
++}
++const paypalRequest = { profileId: "player", provider: "paypal_web", productId: "coins_500_lumarush", exportTarget: "web", payload: { order_id: "ORDER-1" } };
++const completedOrder = () => ({ id: "ORDER-1", status: "COMPLETED", purchase_units: [{ amount: { value: "0.99", currency_code: "USD" }, payments: { captures: [{ id: "CAPTURE-1", status: "COMPLETED", amount: { value: "0.99", currency_code: "USD" } }] } }] });
++
++describe("server-time subscription lifecycle", () => {
++  for (const [offset, active] of [[1, true], [0, false], [-1, false]]) {
++    it(`Apple receipt at expiry offset ${offset} ignores client clock/expiry`, async () => {
++      const service = appleService(receipt(now + offset));
++      const result = await service.verifyPurchase({ ...subRequest, nowSeconds: 1 });
++      assert.equal(result.entitlements.no_ads.active, active);
++      assert.equal(result.entitlements.no_ads.expires_at, now + offset);
++    });
++  }
++
++  it("rechecks expiry on reads and on a deduplicated verification", async () => {
++    let clock = now;
++    const service = appleService(receipt(now + 5), () => clock);
++    assert.equal((await service.verifyPurchase(subRequest)).entitlements.no_ads.active, true);
++    clock += 5;
++    assert.deepEqual((await service.getEntitlements({ profileId: "player", nowSeconds: 1 })).no_ads, { active: false, status: "expired", expires_at: now + 5 });
++    const retry = await service.verifyPurchase(subRequest);
++    assert.equal(retry.deduplicated, true);
++    assert.equal(retry.entitlements.no_ads.active, false);
++  });
++
++  it("uses latest matching Apple line and never falls back to another product", async () => {
++    const reply = receipt(now - 10);
++    reply.latest_receipt_info.push(receipt(now + 100, "no_ads_monthly", "renewed-tx").latest_receipt_info[0]);
++    assert.equal((await appleService(reply).verifyPurchase(subRequest)).entitlements.no_ads.active, true);
++    await assert.rejects(appleService(receipt(now + 100, "different-product")).verifyPurchase(subRequest), /matching product/);
++  });
++
++  it("rejects malformed verified expiry and receipt payload before entitlement grant", async () => {
++    const service = appleService(receipt(NaN));
++    await assert.rejects(service.verifyPurchase(subRequest), /valid expiry/);
++    assert.equal((await service.getEntitlements({ profileId: "player" })).no_ads.active, false);
++    for (const receipt_data of [undefined, {}, 42, " "]) {
++      await assert.rejects(appleService({}).verifyPurchase({ ...subRequest, payload: { receipt_data } }), /receipt_data is required/);
++    }
++  });
++
++  it("never grants indefinite or malformed stored subscriptions", async () => {
++    for (const expiresAt of [undefined, 0, NaN, Infinity, "bad", now - 1]) {
++      const store = new InMemoryIapStore();
++      await store.upsertSubscription("player", { active: true, status: "active", expiresAt });
++      const service = createIapService({ store, clock: () => now });
++      assert.equal((await service.getEntitlements({ profileId: "player" })).no_ads.active, false);
++    }
++  });
++
++  it("passes only construction-owned time to provider verification", async () => {
++    let received;
++    const service = createIapService({ clock: () => now, providerRegistry: { verifyPurchase: async (input) => {
++      received = input.nowSeconds;
++      return { provider: "apple", type: "subscription", externalTransactionId: "tx", subscription: { active: true, status: "active", expiresAt: now + 10 } };
++    } } });
++    await service.verifyPurchase({ ...subRequest, nowSeconds: 1 });
++    assert.equal(received, now);
++  });
++});
++
++describe("PayPal captured-payment verification", () => {
++  it("grants a completed captured payment once, preserving order-ID deduplication", async () => {
++    const service = paypalService(completedOrder());
++    const first = await service.verifyPurchase(paypalRequest);
++    const again = await service.verifyPurchase(paypalRequest);
++    assert.equal(first.purchase.externalTransactionId, "ORDER-1");
++    assert.equal(first.entitlements.coins.lumarush.balance, 500);
++    assert.equal(again.deduplicated, true);
++    assert.equal(again.entitlements.coins.lumarush.balance, 500);
++  });
++
++  for (const status of ["APPROVED", "CREATED", "PAYER_ACTION_REQUIRED", "", undefined]) {
++    it(`rejects uncaptured order status ${status}`, async () => {
++      const order = completedOrder(); order.status = status;
++      const service = paypalService(order);
++      await assert.rejects(service.verifyPurchase(paypalRequest), /order not complete/);
++      assert.deepEqual((await service.getEntitlements({ profileId: "player" })).coins, {});
++    });
++  }
++
++  it("rejects missing/pending captures, mismatched order and incomplete amount data", async () => {
++    const changes = [
++      (o) => { delete o.purchase_units[0].payments; },
++      (o) => { o.purchase_units[0].payments.captures[0].status = "PENDING"; },
++      (o) => { o.id = "OTHER"; },
++      (o) => { o.purchase_units[0].payments.captures[0].amount.value = "0.98"; },
++      (o) => { delete o.purchase_units[0].payments.captures[0].amount.currency_code; },
++      (o) => { o.purchase_units[0].amount.value = "NaN"; },
++      (o) => { o.purchase_units.push(o.purchase_units[0]); }
++    ];
++    for (const change of changes) {
++      const order = completedOrder(); change(order);
++      await assert.rejects(paypalService(order).verifyPurchase(paypalRequest), /paypal/);
++    }
++  });
++
++  it("rejects subscription Orders payloads regardless of client expiry, before network", async () => {
++    let requests = 0;
++    const service = paypalService(completedOrder(), () => requests++);
++    await assert.rejects(service.verifyPurchase({ ...paypalRequest, productId: "no_ads_monthly", payload: { order_id: "ORDER-1", expires_at: now + 1_000_000, now_seconds: 1 } }), /subscription verification is not supported/);
++    assert.equal(requests, 0);
++  });
++
++  it("rejects malformed order IDs and unconfigured credentials", async () => {
++    const provider = createPaypalWebProvider({ fetch: () => { throw new Error("unexpected network"); } });
++    for (const order_id of [undefined, 42, {}, " "]) {
++      await assert.rejects(provider.verifyPurchase({ payload: { order_id }, catalogEntry: { type: "consumable" } }), /order_id is required/);
++    }
++    await assert.rejects(provider.verifyPurchase({ payload: { order_id: "ORDER-1" }, catalogEntry: { type: "consumable" } }), /credentials are not configured/);
++  });
++});
++
++describe("Google verified subscription response (mocked OAuth and publisher API)", () => {
++  function serviceFor(t, subscription) {
++    // No credentials or signing keys are generated; OAuth signatures and HTTP
++    // responses are test doubles, not evidence of live Google verification.
++    t.mock.method(crypto, "createSign", () => ({ update() {}, end() {}, sign() { return Buffer.from("test-signature"); } }));
++    return createIapService({ clock: () => now, providers: { google: {
++      clientEmail: "test@example.invalid", privateKey: "test-key-placeholder",
++      fetch: async (url) => url.includes("oauth2") ? json({ access_token: "test-token" }) : json(subscription)
++    } } });
++  }
++  const request = { profileId: "player", provider: "google", productId: "no_ads_monthly", exportTarget: "android", payload: { package_name: "test.game", purchase_token: "test-purchase", now_seconds: 1, expires_at: now + 99999 } };
++  const sub = (state, offset = 10, productId = "no_ads_monthly") => ({ latestOrderId: "google-order", subscriptionState: state, lineItems: [{ productId, expiryTime: new Date((now + offset) * 1000).toISOString() }] });
++  for (const [state, active] of [["ACTIVE", true], ["CANCELED", true], ["IN_GRACE_PERIOD", true], ["ON_HOLD", false], ["PAUSED", false], ["PENDING", false]]) {
++    it(`handles verified state ${state}`, async (t) => {
++      const service = serviceFor(t, sub(`SUBSCRIPTION_STATE_${state}`));
++      assert.equal((await service.verifyPurchase(request)).entitlements.no_ads.active, active);
++    });
++  }
++  it("expires exactly at the server boundary despite client clock override", async (t) => {
++    const service = serviceFor(t, sub("SUBSCRIPTION_STATE_ACTIVE", 0));
++    assert.equal((await service.verifyPurchase(request)).entitlements.no_ads.active, false);
++  });
++  it("rejects missing state, wrong product and malformed expiry", async (t) => {
++    for (const reply of [sub("", 10), sub("SUBSCRIPTION_STATE_ACTIVE", 10, "other"), { ...sub("SUBSCRIPTION_STATE_ACTIVE"), lineItems: [{ productId: "no_ads_monthly", expiryTime: "bad" }] }]) {
++      await assert.rejects(serviceFor(t, reply).verifyPurchase(request), /google subscription missing/);
++    }
++  });
++});
+-- 
+2.39.3 (Apple Git-145)
+

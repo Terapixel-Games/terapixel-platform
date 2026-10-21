@@ -1,0 +1,411 @@
+From 6da42b34eef2b09c318f084378273e7e3c2127e3 Mon Sep 17 00:00:00 2001
+From: SyntaxStacks <johnbobsexipants@gmail.com>
+Date: Tue, 20 Oct 2026 13:42:25 -0500
+Subject: [PATCH] Require game-scoped backend proof for Nakama identity
+ exchange
+
+---
+ services/identity-gateway/README.md           | 60 +++++++++++++
+ services/identity-gateway/src/httpServer.js   |  8 +-
+ .../src/identityGatewayService.js             | 40 +++++++++
+ services/identity-gateway/src/main.js         |  1 +
+ test/identity-gateway-http.test.js            |  3 +
+ test/identity-gateway.test.js                 |  9 ++
+ test/nakama-exchange-auth.test.js             | 89 +++++++++++++++++++
+ 7 files changed, 208 insertions(+), 2 deletions(-)
+ create mode 100644 test/nakama-exchange-auth.test.js
+
+diff --git a/services/identity-gateway/README.md b/services/identity-gateway/README.md
+index e8c7349..2e78231 100644
+--- a/services/identity-gateway/README.md
++++ b/services/identity-gateway/README.md
+@@ -110,3 +110,63 @@ Optional env:
+ Notes:
+ - Magic-link web completion redirect now returns only `tpx_auth=1` (no identity PII query params).
+ - Browser identity should hydrate via `GET /v1/web/session` cookie check.
++
++### Nakama backend exchange authentication and rollout
++
++`POST /v1/auth/nakama` is a backend-only exchange. Configure
++`NAKAMA_EXCHANGE_KEYS_JSON` as a secret JSON object mapping normalized game IDs
++(lowercase, no surrounding whitespace) to distinct backend credentials of at least
++32 bytes. No credentials are supplied by this repository. Missing/empty configuration
++leaves the Nakama exchange disabled (401); malformed configuration stops startup.
++There is no fallback to `INTERNAL_SERVICE_KEY`, `IDENTITY_ADMIN_KEY`, platform
++sessions, Nakama HTTP keys, or a shared cross-game key.
++
++The trusted backend sends its game's credential in `x-nakama-exchange-key`, over
++HTTPS, with `game_id`, `nakama_user_id`, and optional `display_name`. The credential
++only authorizes its configured game. Treat it as authority to assert any identity
++within that game: keep it server-side, out of game exports, logs and source control.
++The backend MUST require an authenticated Nakama context and derive the user ID
++from `ctx.userId`; never forward a client-selected user ID. This is backend
++assertion authentication, not verification of a Nakama player session JWT.
++Issued sessions retain the configured `SESSION_ISSUER` and `SESSION_AUDIENCE` and
++include `game_id` and `nakama_user_id`. Request bodies cannot override audience or
++issuance time. Consumers requiring game isolation must validate `game_id` as well
++as the platform audience; this patch does not change downstream authorization.
++Public web/magic-link routes and CrazyGames verification are unchanged.
++
++Rollout prerequisites (not performed by this patch):
++
++1. Provision distinct per-game, per-environment credentials through approved secret
++   management and configure the gateway's `NAKAMA_EXCHANGE_KEYS_JSON`.
++2. Update every backend exchange caller to send `x-nakama-exchange-key` and use
++   only authenticated `ctx.userId`. Coordinate caller/configuration rollout before
++   enabling exchange; old callers intentionally receive 401 after this patch.
++3. Test with controlled staging accounts from a commit merged to `main`, then
++   promote that reviewed main revision to production. Never test forged production
++   identities. Removal of a game's mapping revokes its ability to exchange;
++   existing issued platform sessions remain valid until expiry.
++
++Read-only caller inspection found `LumaRush/backend/nakama/modules/index.js` has
++both `rpcPlatformAuthExchange` and `exchangePlatformSession` calling this route
++without proof. The RPC currently prefers payload `nakama_user_id` over `ctx.userId`;
++that must be corrected before giving this backend an exchange credential.
++`LumaRush/backend/nakama/modules/lumarush.js` also exchanges without proof, using
++`ctx.userId` and `TPX_PLATFORM_IDENTITY_NAKAMA_AUTH_URL`. The canonical
++`Terapixel-Games/ArcadeCore` repository was unavailable (GitHub returned repository
++not found), so its `backend/templates/nakama-game-backend` could not be verified;
++update/audit the canonical template and all generated backends before rollout.
++Caller repositories were not modified.
++
++Source review confirms this route previously minted sessions from supplied IDs,
++`main.js` added no caller authentication, and the Cloud Run manifest declares the
++identity service public. Actual deployed exposure has not been verified.
++
++Release trigger review: `.github/workflows/cloudrun-deploy.yml` runs on pushes to
++`main` (staging), version tags `v*` (production), and manual dispatch. Deploys are
++conditional on environment `CLOUDRUN_ENABLED`; live variable values were not
++inspected. CI tests and deployment are separate workflows, so deployment does not
++wait for the CI workflow. Render deployment is manual. Branch pushes and PRs do
++not trigger the checked-in deployment workflows. Tag/manual workflows do not
++currently enforce ancestry from main; release operators must select a reviewed
++main revision. No merge, tag, workflow dispatch, deployment, or live configuration
++change is part of this patch.
+diff --git a/services/identity-gateway/src/httpServer.js b/services/identity-gateway/src/httpServer.js
+index de91f46..2890f42 100644
+--- a/services/identity-gateway/src/httpServer.js
++++ b/services/identity-gateway/src/httpServer.js
+@@ -1,5 +1,6 @@
+ import http from "node:http";
+ import crypto from "node:crypto";
++import { NakamaExchangeAuthError } from "./identityGatewayService.js";
+ import {
+   JwtValidationError,
+   createSessionToken,
+@@ -99,6 +100,9 @@ export function createIdentityGatewayHttpServer(options = {}) {
+         requestId
+       });
+     } catch (error) {
++      if (error instanceof NakamaExchangeAuthError) {
++        error = new HttpError(401, "unauthorized", error.message);
++      }
+       if (error instanceof HttpError) {
+         writeJson(res, error.statusCode, {
+           request_id: requestId,
+@@ -353,8 +357,8 @@ async function handleRequest(req, res, ctx) {
+     const result = await ctx.service.authenticateNakamaUser({
+       nakamaUserId,
+       gameId,
+-      displayName: body.display_name,
+-      nowSeconds: body.nowSeconds
++      backendKey: req.headers["x-nakama-exchange-key"],
++      displayName: body.display_name
+     });
+     writeJson(res, 200, {
+       request_id: ctx.requestId,
+diff --git a/services/identity-gateway/src/identityGatewayService.js b/services/identity-gateway/src/identityGatewayService.js
+index d2a6499..8c3f3da 100644
+--- a/services/identity-gateway/src/identityGatewayService.js
++++ b/services/identity-gateway/src/identityGatewayService.js
+@@ -4,6 +4,7 @@ import { createSessionToken } from "../../../packages/shared-utils/index.js";
+ import { InMemoryIdentityStore } from "./identityStore.js";
+ 
+ export function createIdentityGatewayService(options = {}) {
++  const nakamaExchangeKeys = parseNakamaExchangeKeys(options.nakamaExchangeKeysJson);
+   const identityStore = options.identityStore || new InMemoryIdentityStore();
+   const mergeCoordinator = options.mergeCoordinator || createNoopMergeCoordinator();
+   const magicLinkCompletionNotifier =
+@@ -99,6 +100,14 @@ export function createIdentityGatewayService(options = {}) {
+       if (!nakamaUserId) {
+         throw new Error("nakamaUserId is required");
+       }
++      const expectedKey = nakamaExchangeKeys[gameId];
++      const suppliedKey = typeof input?.backendKey === "string" ? input.backendKey : "";
++      if (!expectedKey || !suppliedKey || !crypto.timingSafeEqual(
++        crypto.createHash("sha256").update(expectedKey || "").digest(),
++        crypto.createHash("sha256").update(suppliedKey).digest()
++      )) {
++        throw new NakamaExchangeAuthError();
++      }
+       const now = normalizeNow(input?.nowSeconds);
+       const existing = await identityStore.findPlayerByNakama(gameId, nakamaUserId);
+       if (existing) {
+@@ -119,6 +128,7 @@ export function createIdentityGatewayService(options = {}) {
+           player: updated,
+           ...buildSession(updated.playerId, now, sessionConfig, {
+             nakamaUserId,
++            gameId,
+             displayName: updated.displayName
+           })
+         };
+@@ -140,6 +150,7 @@ export function createIdentityGatewayService(options = {}) {
+         player,
+         ...buildSession(primaryProfileId, now, sessionConfig, {
+           nakamaUserId,
++          gameId,
+           displayName: player.displayName
+         })
+       };
+@@ -379,6 +390,7 @@ function buildSession(profileId, now, sessionConfig, identityContext = {}) {
+     {
+       sub: profileId,
+       scope: "player_session",
++      game_id: normalizeGameId(identityContext.gameId) || undefined,
+       nakama_user_id: nakamaUserId || undefined,
+       display_name: displayName || undefined,
+       email: email || undefined
+@@ -615,3 +627,31 @@ function dedupeTokens(values) {
+   }
+   return out;
+ }
++
++// Dedicated, per-game backend credentials. Never fall back to platform admin keys.
++export class NakamaExchangeAuthError extends Error {
++  constructor() {
++    super("Nakama backend authentication required");
++    this.name = "NakamaExchangeAuthError";
++  }
++}
++
++export function parseNakamaExchangeKeys(raw) {
++  if (raw === undefined || raw === "") return Object.create(null);
++  let parsed;
++  try { parsed = JSON.parse(raw); } catch { throw new Error("NAKAMA_EXCHANGE_KEYS_JSON must be a JSON object"); }
++  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
++    throw new Error("NAKAMA_EXCHANGE_KEYS_JSON must be a JSON object");
++  }
++  const keys = Object.create(null);
++  const seen = new Set();
++  for (const [gameId, key] of Object.entries(parsed)) {
++    if (!gameId || gameId !== normalizeGameId(gameId) || typeof key !== "string" ||
++        key !== key.trim() || Buffer.byteLength(key) < 32 || seen.has(key)) {
++      throw new Error("NAKAMA_EXCHANGE_KEYS_JSON requires normalized game IDs and unique keys of at least 32 bytes");
++    }
++    keys[gameId] = key;
++    seen.add(key);
++  }
++  return keys;
++}
+diff --git a/services/identity-gateway/src/main.js b/services/identity-gateway/src/main.js
+index fb9dc33..7c227be 100644
+--- a/services/identity-gateway/src/main.js
++++ b/services/identity-gateway/src/main.js
+@@ -26,6 +26,7 @@ async function main() {
+ 
+   const service = createIdentityGatewayService({
+     identityStore: await createIdentityStore(config),
++    nakamaExchangeKeysJson: process.env.NAKAMA_EXCHANGE_KEYS_JSON,
+     mergeCoordinator: createHttpMergeCoordinator({
+       adminKey: config.internalServiceKey,
+       iapMergeUrl: config.iapMergeUrl,
+diff --git a/test/identity-gateway-http.test.js b/test/identity-gateway-http.test.js
+index e050db1..4ec47ef 100644
+--- a/test/identity-gateway-http.test.js
++++ b/test/identity-gateway-http.test.js
+@@ -17,6 +17,7 @@ describe("identity-gateway http", () => {
+   const sessionSecret = "identity-session-secret-12345";
+   let lastMagicLink = "";
+   const service = createIdentityGatewayService({
++    nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+     sessionSecret,
+     sessionIssuer: "terapixel.identity",
+     sessionAudience: "terapixel.game",
+@@ -90,6 +91,7 @@ describe("identity-gateway http", () => {
+     const response = await fetch(`${baseUrl}/v1/auth/nakama`, {
+       method: "POST",
+       headers: {
++        "x-nakama-exchange-key": "test-lumarush-backend-key-32-bytes-long",
+         "content-type": "application/json"
+       },
+       body: JSON.stringify({
+@@ -271,6 +273,7 @@ describe("identity-gateway http", () => {
+     const authResponse = await fetch(`${baseUrl}/v1/auth/nakama`, {
+       method: "POST",
+       headers: {
++        "x-nakama-exchange-key": "test-lumarush-backend-key-32-bytes-long",
+         "content-type": "application/json"
+       },
+       body: JSON.stringify({
+diff --git a/test/identity-gateway.test.js b/test/identity-gateway.test.js
+index 56ab086..d3bcb45 100644
+--- a/test/identity-gateway.test.js
++++ b/test/identity-gateway.test.js
+@@ -23,12 +23,14 @@ describe("identity-gateway service", () => {
+   it("authenticates nakama user and mints session with nakama claim", async () => {
+     const now = 1_800_000_050;
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       sessionSecret: "identity-session-secret-12345",
+       sessionIssuer: "terapixel.identity",
+       sessionAudience: "terapixel.game",
+       sessionTtlSeconds: 300
+     });
+     const result = await service.authenticateNakamaUser({
++      backendKey: "test-lumarush-backend-key-32-bytes-long",
+       gameId: "lumarush",
+       nakamaUserId: "nk-user-1",
+       nowSeconds: now
+@@ -48,18 +50,21 @@ describe("identity-gateway service", () => {
+   it("creates and redeems merge code", async () => {
+     const now = 1_800_000_100;
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       sessionSecret: "identity-session-secret-12345",
+       sessionIssuer: "terapixel.identity",
+       sessionAudience: "terapixel.game",
+       sessionTtlSeconds: 300
+     });
+     const primaryAuth = await service.authenticateNakamaUser({
++      backendKey: "test-lumarush-backend-key-32-bytes-long",
+       gameId: "lumarush",
+       nakamaUserId: "primary",
+       displayName: "PrimeUser",
+       nowSeconds: now
+     });
+     const secondaryAuth = await service.authenticateNakamaUser({
++      backendKey: "test-lumarush-backend-key-32-bytes-long",
+       gameId: "lumarush",
+       nakamaUserId: "secondary",
+       nowSeconds: now + 1
+@@ -96,6 +101,7 @@ describe("identity-gateway service", () => {
+     const keyStore = createStaticKeyStore(publicKey, "cg-kid");
+     const now = 1_800_000_000;
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       sessionSecret: "identity-session-secret-12345",
+       sessionIssuer: "terapixel.identity",
+       sessionAudience: "terapixel.game",
+@@ -122,6 +128,7 @@ describe("identity-gateway service", () => {
+ 
+   it("upgrades new email link via magic link completion", async () => {
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       magicLinkBaseUrl: "https://terapixel.games/auth/magic-link"
+     });
+     const token = await service.identityStore.createMagicLinkToken(
+@@ -139,6 +146,7 @@ describe("identity-gateway service", () => {
+ 
+   it("merges when email is linked to another profile", async () => {
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       magicLinkBaseUrl: "https://terapixel.games/auth/magic-link"
+     });
+     await service.identityStore.upsertEmailLink("linked@example.com", "nk_primary");
+@@ -158,6 +166,7 @@ describe("identity-gateway service", () => {
+ 
+   it("validates username moderation with global and game blocklists", async () => {
+     const service = createIdentityGatewayService({
++      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
+       usernameModerationGlobalTokens: ["admin", "support"],
+       usernameModerationByGame: {
+         lumarush: ["lumaevil"]
+diff --git a/test/nakama-exchange-auth.test.js b/test/nakama-exchange-auth.test.js
+new file mode 100644
+index 0000000..639699f
+--- /dev/null
++++ b/test/nakama-exchange-auth.test.js
+@@ -0,0 +1,89 @@
++import { describe, it } from "node:test";
++import assert from "node:assert/strict";
++import { createIdentityGatewayService, createIdentityGatewayHttpServer } from "../services/identity-gateway/index.js";
++import { parseNakamaExchangeKeys } from "../services/identity-gateway/src/identityGatewayService.js";
++import { verifySessionToken } from "../packages/shared-utils/index.js";
++
++const keyA = "test-game-a-backend-key-at-least-32-bytes";
++const keyB = "test-game-b-backend-key-at-least-32-bytes";
++const config = JSON.stringify({ a: keyA, b: keyB });
++const sessionSecret = "test-platform-session-signing-secret";
++
++describe("Nakama exchange backend authentication", () => {
++  it("rejects malformed configuration without echoing secrets", () => {
++    for (const raw of ["{", "null", "[]", JSON.stringify({ A: keyA }), JSON.stringify({ a: "short" }), JSON.stringify({ a: keyA, b: keyA })]) {
++      assert.throws(() => parseNakamaExchangeKeys(raw), /NAKAMA_EXCHANGE_KEYS_JSON/);
++    }
++  });
++
++  it("fails closed in the service before touching identity storage", async () => {
++    for (const raw of [undefined, "{}", config]) {
++      const service = createIdentityGatewayService({ nakamaExchangeKeysJson: raw, identityStore: new Proxy({}, { get() { throw new Error("storage touched"); } }) });
++      for (const backendKey of [undefined, "", "wrong", keyB]) {
++        await assert.rejects(service.authenticateNakamaUser({ gameId: "a", nakamaUserId: "victim", backendKey }), { name: "NakamaExchangeAuthError" });
++      }
++    }
++  });
++
++  it("rejects unauthenticated HTTP requests and binds successful sessions to game and configured audience", async () => {
++    const service = createIdentityGatewayService({ nakamaExchangeKeysJson: config, sessionSecret, sessionAudience: "test.platform" });
++    const server = createIdentityGatewayHttpServer({ service, sessionSecret, internalServiceKey: "admin-key" });
++    const { baseUrl } = await server.listen();
++    try {
++      for (const [gameId, headers] of [
++        ["a", {}], ["a", { "x-nakama-exchange-key": "wrong" }],
++        ["a", { "x-admin-key": "admin-key" }],
++        ["a", { authorization: `Bearer ${keyA}` }],
++        ["a", { "x-nakama-exchange-key": keyB }],
++        ["unknown", { "x-nakama-exchange-key": keyA }]
++      ]) {
++        const response = await fetch(`${baseUrl}/v1/auth/nakama`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify({ game_id: gameId, nakama_user_id: "victim", backendKey: keyA }) });
++        assert.equal(response.status, 401);
++        assert.equal((await response.json()).session_token, undefined);
++      }
++      const before = Math.floor(Date.now() / 1000);
++      const response = await fetch(`${baseUrl}/v1/auth/nakama`, { method: "POST", headers: { "content-type": "application/json", "x-nakama-exchange-key": keyA }, body: JSON.stringify({ game_id: " A ", nakama_user_id: "user-1", nowSeconds: 4_000_000_000, audience: "attacker" }) });
++      assert.equal(response.status, 200);
++      const result = await response.json();
++      const claims = verifySessionToken(result.session_token, sessionSecret, { issuer: "terapixel.identity", audience: "test.platform" });
++      assert.equal(claims.game_id, "a");
++      assert.equal(claims.nakama_user_id, "user-1");
++      assert.ok(claims.iat >= before && claims.iat <= Math.floor(Date.now() / 1000));
++      assert.throws(() => verifySessionToken(result.session_token, sessionSecret, { audience: "attacker" }));
++    } finally { await server.close(); }
++  });
++
++  it("isolates identical user IDs across games and preserves game binding on repeat exchange", async () => {
++    const service = createIdentityGatewayService({ nakamaExchangeKeysJson: config, sessionSecret });
++    const a = await service.authenticateNakamaUser({ gameId: "a", nakamaUserId: "same-user", backendKey: keyA });
++    const b = await service.authenticateNakamaUser({ gameId: "b", nakamaUserId: "same-user", backendKey: keyB });
++    assert.notEqual(a.player.playerId, b.player.playerId);
++    const again = await service.authenticateNakamaUser({ gameId: "a", nakamaUserId: "same-user", backendKey: keyA });
++    assert.equal(again.isNewPlayer, false);
++    assert.equal(again.player.playerId, a.player.playerId);
++    assert.equal(verifySessionToken(again.sessionToken, sessionSecret, { audience: "terapixel.game" }).game_id, "a");
++  });
++
++  it("keeps public health and magic-link routes available with exchange disabled", async () => {
++    let linkUrl = "";
++    const service = createIdentityGatewayService({
++      sessionSecret,
++      magicLinkBaseUrl: "http://identity.test/v1/account/magic-link/consume",
++      magicLinkEmailSender: { sendMagicLink: async (input) => { linkUrl = input.linkUrl; } }
++    });
++    const server = createIdentityGatewayHttpServer({ service, sessionSecret });
++    const { baseUrl } = await server.listen();
++    try {
++      const denied = await fetch(`${baseUrl}/v1/auth/nakama`, { method: "POST", headers: { "content-type": "application/json", "x-nakama-exchange-key": keyA }, body: JSON.stringify({ game_id: "a", nakama_user_id: "victim" }) });
++      assert.equal(denied.status, 401);
++      assert.equal((await fetch(`${baseUrl}/healthz`)).status, 200);
++      assert.equal((await fetch(`${baseUrl}/v1/web/session`)).status, 200);
++      assert.equal((await fetch(`${baseUrl}/v1/web/login?email=player%40example.test`)).status, 200);
++      assert.ok(linkUrl);
++      const consume = new URL(linkUrl);
++      const completed = await fetch(`${baseUrl}${consume.pathname}${consume.search}`, { redirect: "manual" });
++      assert.equal(completed.status, 200);
++      assert.ok(completed.headers.get("set-cookie"));
++    } finally { await server.close(); }
++  });
++});
+-- 
+2.39.3 (Apple Git-145)
+

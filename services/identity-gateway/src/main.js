@@ -26,6 +26,7 @@ async function main() {
 
   const service = createIdentityGatewayService({
     identityStore: await createIdentityStore(config),
+    nakamaExchangeKeysJson: process.env.NAKAMA_EXCHANGE_KEYS_JSON,
     mergeCoordinator: createHttpMergeCoordinator({
       adminKey: config.internalServiceKey,
       iapMergeUrl: config.iapMergeUrl,
@@ -75,6 +76,7 @@ async function main() {
     service,
     bodyLimitBytes: config.bodyLimitBytes,
     allowedOrigins: config.allowedOrigins,
+    edgeIngressSecret: config.edgeIngressSecret,
     sessionSecret: config.sessionSecret,
     sessionSigningAlg: config.sessionSigningAlg,
     sessionSigningKeyId: config.sessionSigningKeyId,
@@ -167,6 +169,7 @@ function readConfig(env) {
       "https://sdk.crazygames.com/authentication/",
     expectedAudience: requiredEnv(env, "CRAZYGAMES_EXPECTED_AUDIENCE"),
     allowedOrigins: env.CORS_ALLOWED_ORIGINS || "",
+    edgeIngressSecret: String(env.EDGE_INGRESS_SECRET || "").trim(),
     jwksTtlSeconds: parseIntWithDefault(env.JWKS_TTL_SECONDS, 600),
     clockSkewSeconds: parseIntWithDefault(env.CLOCK_SKEW_SECONDS, 10),
     sessionSecret,

@@ -23,12 +23,14 @@ describe("identity-gateway service", () => {
   it("authenticates nakama user and mints session with nakama claim", async () => {
     const now = 1_800_000_050;
     const service = createIdentityGatewayService({
+      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
       sessionSecret: "identity-session-secret-12345",
       sessionIssuer: "terapixel.identity",
       sessionAudience: "terapixel.game",
       sessionTtlSeconds: 300
     });
     const result = await service.authenticateNakamaUser({
+      backendKey: "test-lumarush-backend-key-32-bytes-long",
       gameId: "lumarush",
       nakamaUserId: "nk-user-1",
       nowSeconds: now
@@ -48,18 +50,21 @@ describe("identity-gateway service", () => {
   it("creates and redeems merge code", async () => {
     const now = 1_800_000_100;
     const service = createIdentityGatewayService({
+      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
       sessionSecret: "identity-session-secret-12345",
       sessionIssuer: "terapixel.identity",
       sessionAudience: "terapixel.game",
       sessionTtlSeconds: 300
     });
     const primaryAuth = await service.authenticateNakamaUser({
+      backendKey: "test-lumarush-backend-key-32-bytes-long",
       gameId: "lumarush",
       nakamaUserId: "primary",
       displayName: "PrimeUser",
       nowSeconds: now
     });
     const secondaryAuth = await service.authenticateNakamaUser({
+      backendKey: "test-lumarush-backend-key-32-bytes-long",
       gameId: "lumarush",
       nakamaUserId: "secondary",
       nowSeconds: now + 1
@@ -96,6 +101,7 @@ describe("identity-gateway service", () => {
     const keyStore = createStaticKeyStore(publicKey, "cg-kid");
     const now = 1_800_000_000;
     const service = createIdentityGatewayService({
+      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
       sessionSecret: "identity-session-secret-12345",
       sessionIssuer: "terapixel.identity",
       sessionAudience: "terapixel.game",
@@ -122,6 +128,7 @@ describe("identity-gateway service", () => {
 
   it("upgrades new email link via magic link completion", async () => {
     const service = createIdentityGatewayService({
+      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
       magicLinkBaseUrl: "https://terapixel.games/auth/magic-link"
     });
     const token = await service.identityStore.createMagicLinkToken(
@@ -139,6 +146,7 @@ describe("identity-gateway service", () => {
 
   it("merges when email is linked to another profile", async () => {
     const service = createIdentityGatewayService({
+      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
       magicLinkBaseUrl: "https://terapixel.games/auth/magic-link"
     });
     await service.identityStore.upsertEmailLink("linked@example.com", "nk_primary");
@@ -158,6 +166,7 @@ describe("identity-gateway service", () => {
 
   it("validates username moderation with global and game blocklists", async () => {
     const service = createIdentityGatewayService({
+      nakamaExchangeKeysJson: JSON.stringify({ lumarush: "test-lumarush-backend-key-32-bytes-long" }),
       usernameModerationGlobalTokens: ["admin", "support"],
       usernameModerationByGame: {
         lumarush: ["lumaevil"]

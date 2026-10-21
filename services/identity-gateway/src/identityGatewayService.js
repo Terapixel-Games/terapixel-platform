@@ -4,6 +4,7 @@ import { createSessionToken } from "../../../packages/shared-utils/index.js";
 import { InMemoryIdentityStore } from "./identityStore.js";
 
 export function createIdentityGatewayService(options = {}) {
+  const nakamaExchangeKeys = parseNakamaExchangeKeys(options.nakamaExchangeKeysJson);
   const identityStore = options.identityStore || new InMemoryIdentityStore();
   const mergeCoordinator = options.mergeCoordinator || createNoopMergeCoordinator();
   const magicLinkCompletionNotifier =
@@ -99,6 +100,14 @@ export function createIdentityGatewayService(options = {}) {
       if (!nakamaUserId) {
         throw new Error("nakamaUserId is required");
       }
+      const expectedKey = nakamaExchangeKeys[gameId];
+      const suppliedKey = typeof input?.backendKey === "string" ? input.backendKey : "";
+      if (!expectedKey || !suppliedKey || !crypto.timingSafeEqual(
+        crypto.createHash("sha256").update(expectedKey || "").digest(),
+        crypto.createHash("sha256").update(suppliedKey).digest()
+      )) {
+        throw new NakamaExchangeAuthError();
+      }
       const now = normalizeNow(input?.nowSeconds);
       const existing = await identityStore.findPlayerByNakama(gameId, nakamaUserId);
       if (existing) {
@@ -119,6 +128,7 @@ export function createIdentityGatewayService(options = {}) {
           player: updated,
           ...buildSession(updated.playerId, now, sessionConfig, {
             nakamaUserId,
+            gameId,
             displayName: updated.displayName
           })
         };
@@ -140,6 +150,7 @@ export function createIdentityGatewayService(options = {}) {
         player,
         ...buildSession(primaryProfileId, now, sessionConfig, {
           nakamaUserId,
+          gameId,
           displayName: player.displayName
         })
       };
@@ -379,6 +390,7 @@ function buildSession(profileId, now, sessionConfig, identityContext = {}) {
     {
       sub: profileId,
       scope: "player_session",
+      game_id: normalizeGameId(identityContext.gameId) || undefined,
       nakama_user_id: nakamaUserId || undefined,
       display_name: displayName || undefined,
       email: email || undefined
@@ -614,4 +626,32 @@ function dedupeTokens(values) {
     out.push(token);
   }
   return out;
+}
+
+// Dedicated, per-game backend credentials. Never fall back to platform admin keys.
+export class NakamaExchangeAuthError extends Error {
+  constructor() {
+    super("Nakama backend authentication required");
+    this.name = "NakamaExchangeAuthError";
+  }
+}
+
+export function parseNakamaExchangeKeys(raw) {
+  if (raw === undefined || raw === "") return Object.create(null);
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("NAKAMA_EXCHANGE_KEYS_JSON must be a JSON object"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("NAKAMA_EXCHANGE_KEYS_JSON must be a JSON object");
+  }
+  const keys = Object.create(null);
+  const seen = new Set();
+  for (const [gameId, key] of Object.entries(parsed)) {
+    if (!gameId || gameId !== normalizeGameId(gameId) || typeof key !== "string" ||
+        key !== key.trim() || Buffer.byteLength(key) < 32 || seen.has(key)) {
+      throw new Error("NAKAMA_EXCHANGE_KEYS_JSON requires normalized game IDs and unique keys of at least 32 bytes");
+    }
+    keys[gameId] = key;
+    seen.add(key);
+  }
+  return keys;
 }

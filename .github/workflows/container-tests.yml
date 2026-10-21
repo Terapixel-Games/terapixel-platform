@@ -2,11 +2,14 @@ name: Container tests
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main]
+    branches: [main, test/docker-compose-local]
     paths:
       - compose.test.yaml
       - infra/testing/**
       - tools/test-compose.sh
+      - tools/test-helpers/**
+      - scripts/cloudrun/deploy-identity-staging.sh
+      - .github/workflows/*.yml
       - package*.json
       - services/**
       - packages/**

@@ -71,3 +71,20 @@ Publication and CI execution were separately authorized after local validation.
 This harness is based on origin/main bfa62903fd6044727528038148a2b774ebd2ef55.
 Local integration/revision-safe backend patches were not incorporated. This
 checks the mainline API and does not claim concurrency fixes from those branches.
+
+
+## PR8 follow-up and stacked data validation
+
+This harness branch is reconciled with main `174e68e`. It includes the workflow
+source/script inputs and Python needed by main's mocked deployment regression
+tests. Fixtures are interpreted on the existing noexec /tmp; mount protections
+remain unchanged. Node22 remains the pinned default; TEST_NODE_IMAGE can explicitly
+select the tested pinned Node20 image. The runner now fails on any skipped test.
+
+PR8 alone validates PostgreSQL preflight, migration replay, synthetic CRUD and the
+baseline main suite. It does not claim wallet/token/save concurrency coverage until
+the separate data-safety draft is applied. That draft is stacked on
+`test/docker-compose-local`; both CI workflows explicitly accept that PR base.
+Native CI explicitly excludes opt-in real-PG files. The Compose job runs the full
+suite and must execute all data integration tests with zero skips on the data head.
+No cloud workflow is dispatched by these tests and no credentials are mounted.

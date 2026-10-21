@@ -82,3 +82,5 @@ JSON Schemas live in `packages/api-contracts/schemas`.
 ## Notes
 - Services expose `/healthz` for liveness.
 - HTTP responses include `x-request-id` and `request_id` for traceability.
+
+Portable isolated Docker/PostgreSQL tests: [instructions](infra/testing/README.md).

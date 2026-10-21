@@ -26,3 +26,6 @@ coverage/
 
 # Logs
 *.log
+
+# Local container test evidence
+reports/

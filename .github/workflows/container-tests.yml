@@ -1,0 +1,31 @@
+name: Container tests
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - compose.test.yaml
+      - infra/testing/**
+      - tools/test-compose.sh
+      - package*.json
+      - services/**
+      - packages/**
+      - adapters/**
+      - test/**
+      - infra/sql-migrations/**
+      - .github/workflows/container-tests.yml
+permissions:
+  contents: read
+jobs:
+  compose-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Required PostgreSQL and native-compatible unit suite
+        run: sh tools/test-compose.sh
+      - name: Show diagnostic logs
+        if: always()
+        run: find reports/compose -type f -name '*.log' -exec cat {} +

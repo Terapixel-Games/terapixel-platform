@@ -2,6 +2,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import {
   JwtValidationError,
+  sessionAllowsGame,
   createSessionTokenVerifier
 } from "../../../packages/shared-utils/index.js";
 
@@ -128,6 +129,7 @@ async function handleRequest(req, res, ctx) {
     }
     const body = await readJsonBody(req, ctx.bodyLimitBytes);
     ensureObjectBody(body);
+    if (!sessionAllowsGame(claims, body.game_id)) throw new HttpError(403, "game_scope_mismatch", "session does not authorize this game");
     const result = await ctx.service.verifyPurchase({
       profileId,
       provider: body.provider,
@@ -151,6 +153,7 @@ async function handleRequest(req, res, ctx) {
     }
     const body = await readJsonBody(req, ctx.bodyLimitBytes);
     ensureObjectBody(body);
+    if (!sessionAllowsGame(claims, body.game_id)) throw new HttpError(403, "game_scope_mismatch", "session does not authorize this game");
     const result = await ctx.service.adjustCoins({
       profileId,
       gameId: body.game_id,

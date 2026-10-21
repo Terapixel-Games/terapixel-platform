@@ -13,3 +13,5 @@ export {
   createRuntimeConfigProvider,
   createNoopRuntimeConfigProvider
 } from "./src/platformRuntimeConfigProvider.js";
+
+export { sessionAllowsGame } from "./src/sessionGameScope.js";

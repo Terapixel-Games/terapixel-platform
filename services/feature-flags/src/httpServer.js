@@ -2,6 +2,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import {
   JwtValidationError,
+  sessionAllowsGame,
   createSessionTokenVerifier
 } from "../../../packages/shared-utils/index.js";
 
@@ -117,11 +118,13 @@ async function handleRequest(req, res, ctx) {
     let profileId = String(url.searchParams.get("profile_id") || "");
     if (profileId) {
       const claims = await requireSessionClaims(req, ctx.sessionVerifier, ctx.sessionConfig);
+      if (!sessionAllowsGame(claims, gameId)) throw new HttpError(403, "game_scope_mismatch", "session does not authorize this game");
       if (extractProfileIdFromClaims(claims, ctx.sessionConfig) !== profileId) {
         throw new HttpError(403, "forbidden", "profile_id mismatch");
       }
     } else {
       const claims = await tryGetSessionClaims(req, ctx.sessionVerifier, ctx.sessionConfig);
+      if (!sessionAllowsGame(claims, gameId)) throw new HttpError(403, "game_scope_mismatch", "session does not authorize this game");
       const claimsProfileId = extractProfileIdFromClaims(claims, ctx.sessionConfig);
       if (claimsProfileId) {
         profileId = claimsProfileId;

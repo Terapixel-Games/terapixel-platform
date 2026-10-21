@@ -2,6 +2,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import {
   JwtValidationError,
+  sessionAllowsGame,
   createSessionTokenVerifier
 } from "../../../packages/shared-utils/index.js";
 
@@ -134,6 +135,8 @@ async function handleRequest(req, res, ctx) {
     if (!gameId) {
       throw new HttpError(400, "invalid_request", "game_id is required");
     }
+
+    if (!sessionAllowsGame(claims, gameId)) throw new HttpError(403, "game_scope_mismatch", "session does not authorize this game");
 
     const clientEnvelope =
       body.client_envelope && typeof body.client_envelope === "object"

@@ -71,3 +71,5 @@ Publication and CI execution were separately authorized after local validation.
 This harness is based on origin/main bfa62903fd6044727528038148a2b774ebd2ef55.
 Local integration/revision-safe backend patches were not incorporated. This
 checks the mainline API and does not claim concurrency fixes from those branches.
+
+Prepared-stack real PostgreSQL results: see [DATA_SAFETY_VALIDATION.md](DATA_SAFETY_VALIDATION.md).

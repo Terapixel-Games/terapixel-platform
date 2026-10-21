@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { validateTransactionEffect } from "./transactionEffect.js";
 
 export class InMemoryIapStore {
   constructor(seed = {}) {
@@ -7,6 +8,34 @@ export class InMemoryIapStore {
     this._subscriptions = new Map();
     this._transactions = new Map();
     hydrateSeed(this, seed);
+  }
+
+  // No awaits between validation and publication: each call commits in one JS turn.
+  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
+    validateTransactionEffect(record, effect);
+    const key = txKey(provider, externalTransactionId);
+    if (this._transactions.has(key)) {
+      return { isNew: false, record: deepClone(this._transactions.get(key)) };
+    }
+    const copy = deepClone(record);
+    const result = { isNew: true, record: deepClone(copy) };
+    const subscription = effect.subscription ? deepClone(effect.subscription) : null;
+    let coinKey;
+    let balance;
+    if (effect.coins) {
+      coinKey = balanceKey(record.profileId, effect.coins.gameId);
+      const current = this._coinBalances.get(coinKey)?.balance || 0;
+      balance = current + effect.coins.delta;
+      if (balance < 0) throw new Error("insufficient coins");
+      if (!Number.isSafeInteger(balance) || balance > 2147483647) {
+        throw new Error("coin balance exceeds supported range");
+      }
+    }
+    // All potentially throwing input processing finishes before modifying state.
+    if (effect.coins) this._coinBalances.set(coinKey, { balance });
+    if (subscription) this._subscriptions.set(normalize(record.profileId), subscription);
+    this._transactions.set(key, copy);
+    return result;
   }
 
   async recordTransaction(provider, externalTransactionId, record) {
@@ -92,28 +121,25 @@ export class JsonFileIapStore extends InMemoryIapStore {
       throw new Error("JsonFileIapStore filePath is required");
     }
     this._filePath = filePath;
-    this._loaded = false;
     this._writeQueue = Promise.resolve();
   }
 
-  async recordTransaction(provider, externalTransactionId, record) {
-    await this._ensureLoaded();
-    const result = await super.recordTransaction(
-      provider,
-      externalTransactionId,
-      record
+  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
+    return this._mutate(
+      (staged) => staged.applyTransaction(provider, externalTransactionId, record, effect),
+      (result) => result.isNew
     );
-    if (result.isNew) {
-      await this._enqueueWrite();
-    }
-    return result;
+  }
+
+  async recordTransaction(provider, externalTransactionId, record) {
+    return this._mutate(
+      (staged) => staged.recordTransaction(provider, externalTransactionId, record),
+      (result) => result.isNew
+    );
   }
 
   async addCoins(profileId, gameId, delta) {
-    await this._ensureLoaded();
-    const result = await super.addCoins(profileId, gameId, delta);
-    await this._enqueueWrite();
-    return result;
+    return this._mutate((staged) => staged.addCoins(profileId, gameId, delta));
   }
 
   async getCoins(profileId) {
@@ -127,64 +153,69 @@ export class JsonFileIapStore extends InMemoryIapStore {
   }
 
   async upsertSubscription(profileId, subscription) {
-    await this._ensureLoaded();
-    const result = await super.upsertSubscription(profileId, subscription);
-    await this._enqueueWrite();
-    return result;
+    return this._mutate((staged) => staged.upsertSubscription(profileId, subscription));
   }
 
   async mergeProfiles(primaryProfileId, secondaryProfileId) {
-    await this._ensureLoaded();
-    const result = await super.mergeProfiles(primaryProfileId, secondaryProfileId);
-    if (result.merged) {
-      await this._enqueueWrite();
-    }
-    return result;
+    // Run the existing merge on the isolated in-memory stage. Its internal
+    // addCoins/upsertSubscription calls must not re-enter this file queue.
+    return this._mutate(
+      (staged) => staged.mergeProfiles(primaryProfileId, secondaryProfileId),
+      (result) => result.merged
+    );
+  }
+
+  async _mutate(mutation, shouldWrite = () => true) {
+    const operation = this._writeQueue.then(async () => {
+      await this._ensureLoaded();
+      const staged = new InMemoryIapStore();
+      staged._coinBalances = new Map(this._coinBalances);
+      staged._subscriptions = new Map(this._subscriptions);
+      staged._transactions = new Map(this._transactions);
+      const result = await mutation(staged);
+      if (shouldWrite(result)) {
+        await this._writeSnapshot(staged);
+        this._coinBalances = staged._coinBalances;
+        this._subscriptions = staged._subscriptions;
+        this._transactions = staged._transactions;
+      }
+      return result;
+    });
+    // All mutation paths stage before writing; a failure leaves committed state
+    // intact and cannot poison subsequent operations or consume success keys.
+    this._writeQueue = operation.catch(() => {});
+    return operation;
   }
 
   async _ensureLoaded() {
-    if (this._loaded) {
-      return;
+    if (!this._loadPromise) {
+      this._loadPromise = (async () => {
+        await fs.mkdir(path.dirname(this._filePath), { recursive: true });
+        try {
+          const raw = await fs.readFile(this._filePath, "utf8");
+          if (raw.trim()) hydrateSeed(this, JSON.parse(raw));
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      })().catch((error) => {
+        this._loadPromise = null;
+        throw error;
+      });
     }
-    this._loaded = true;
-    await fs.mkdir(path.dirname(this._filePath), { recursive: true });
-    try {
-      const raw = await fs.readFile(this._filePath, "utf8");
-      if (!raw.trim()) {
-        return;
-      }
-      const parsed = JSON.parse(raw);
-      hydrateSeed(this, parsed);
-    } catch (error) {
-      if (error && error.code === "ENOENT") {
-        return;
-      }
-      throw error;
-    }
+    await this._loadPromise;
   }
 
-  async _enqueueWrite() {
-    this._writeQueue = this._writeQueue.then(async () => {
-      const serialized = JSON.stringify({
-        coin_balances: Array.from(this._coinBalances.entries()).map(([k, v]) => ({
-          key: k,
-          value: v
-        })),
-        subscriptions: Array.from(this._subscriptions.entries()).map(([k, v]) => ({
-          key: k,
-          value: v
-        })),
-        transactions: Array.from(this._transactions.entries()).map(([k, v]) => ({
-          key: k,
-          value: v
-        }))
-      });
-      const tmp = `${this._filePath}.tmp`;
-      await fs.writeFile(tmp, serialized, "utf8");
-      await fs.rename(tmp, this._filePath);
+  async _writeSnapshot(store) {
+    const serialized = JSON.stringify({
+      coin_balances: Array.from(store._coinBalances.entries()).map(([key, value]) => ({ key, value })),
+      subscriptions: Array.from(store._subscriptions.entries()).map(([key, value]) => ({ key, value })),
+      transactions: Array.from(store._transactions.entries()).map(([key, value]) => ({ key, value }))
     });
-    await this._writeQueue;
+    const tmp = `${this._filePath}.tmp`;
+    await fs.writeFile(tmp, serialized, "utf8");
+    await fs.rename(tmp, this._filePath);
   }
+
 }
 
 function hydrateSeed(store, seed) {

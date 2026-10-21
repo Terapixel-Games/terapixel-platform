@@ -1,8 +1,11 @@
+import { validateTransactionEffect } from "./transactionEffect.js";
+import { withPostgresTransaction } from "../../../../packages/shared-utils/index.js";
+
 export class PostgresIapStore {
   constructor(options = {}) {
     this._pool = options.pool;
-    if (!this._pool || typeof this._pool.query !== "function") {
-      throw new Error("PostgresIapStore requires pool.query");
+    if (!this._pool || typeof this._pool.query !== "function" || typeof this._pool.connect !== "function") {
+      throw new Error("PostgresIapStore requires pool.query and pool.connect");
     }
   }
 
@@ -41,7 +44,56 @@ export class PostgresIapStore {
     `);
   }
 
+  async applyTransaction(provider, externalTransactionId, record, effect = {}) {
+    validateTransactionEffect(record, effect);
+    const client = await this._pool.connect();
+    let began = false;
+    let releaseError;
+    try {
+      await client.query("BEGIN");
+      began = true;
+      const result = await this._recordTransaction(client, provider, externalTransactionId, record);
+      if (result.isNew && effect.coins) {
+        const params = [normalize(record.profileId), normalize(effect.coins.gameId), effect.coins.delta];
+        await client.query(
+          `INSERT INTO iap_coin_balances (profile_id, game_id, balance)
+           VALUES ($1, $2, 0) ON CONFLICT (profile_id, game_id) DO NOTHING`,
+          params.slice(0, 2)
+        );
+        // UPDATE locks the wallet row and rechecks this predicate after waiting
+        // for another debit. There is no separate read/check or balance clamp.
+        const updated = await client.query(
+          `UPDATE iap_coin_balances SET balance = balance + $3, updated_at = NOW()
+           WHERE profile_id = $1 AND game_id = $2
+             AND balance::bigint + $3::bigint >= 0
+           RETURNING balance`,
+          params
+        );
+        if (updated.rows.length === 0) throw new Error("insufficient coins");
+      } else if (result.isNew && effect.subscription) {
+        await this._writeSubscription(client, record.profileId, effect.subscription);
+      }
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      if (began) {
+        try { await client.query("ROLLBACK"); } catch (rollbackError) {
+          releaseError = rollbackError;
+        }
+      } else {
+        releaseError = error;
+      }
+      throw error;
+    } finally {
+      client.release(releaseError);
+    }
+  }
+
   async recordTransaction(provider, externalTransactionId, record) {
+    return this._recordTransaction(this._pool, provider, externalTransactionId, record);
+  }
+
+  async _recordTransaction(executor, provider, externalTransactionId, record) {
     const sql = `
       INSERT INTO iap_transactions (provider, external_transaction_id, profile_id, type, product_id, raw)
       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
@@ -56,11 +108,11 @@ export class PostgresIapStore {
       normalize(record?.productId),
       JSON.stringify(record || {})
     ];
-    const inserted = await this._pool.query(sql, params);
+    const inserted = await executor.query(sql, params);
     if (inserted.rows.length > 0) {
       return { isNew: true, record: inserted.rows[0].raw };
     }
-    const existing = await this._pool.query(
+    const existing = await executor.query(
       `SELECT raw FROM iap_transactions WHERE provider = $1 AND external_transaction_id = $2 LIMIT 1`,
       [normalize(provider), normalize(externalTransactionId)]
     );
@@ -99,7 +151,11 @@ export class PostgresIapStore {
   }
 
   async getSubscription(profileId) {
-    const result = await this._pool.query(
+    return this._getSubscription(this._pool, profileId);
+  }
+
+  async _getSubscription(executor, profileId) {
+    const result = await executor.query(
       `SELECT provider, external_subscription_id, status, active, expires_at
        FROM iap_subscriptions WHERE profile_id = $1 LIMIT 1`,
       [normalize(profileId)]
@@ -121,8 +177,13 @@ export class PostgresIapStore {
   }
 
   async upsertSubscription(profileId, subscription) {
+    await this._writeSubscription(this._pool, profileId, subscription);
+    return this.getSubscription(profileId);
+  }
+
+  async _writeSubscription(executor, profileId, subscription) {
     const expiresAt = Number(subscription?.expiresAt);
-    await this._pool.query(
+    await executor.query(
       `
       INSERT INTO iap_subscriptions (profile_id, provider, external_subscription_id, status, active, expires_at, updated_at)
       VALUES ($1, $2, $3, $4, $5, $6, NOW())
@@ -145,7 +206,6 @@ export class PostgresIapStore {
           : null
       ]
     );
-    return this.getSubscription(profileId);
   }
 
   async mergeProfiles(primaryProfileId, secondaryProfileId) {
@@ -155,9 +215,12 @@ export class PostgresIapStore {
       return { merged: false };
     }
 
-    await this._pool.query("BEGIN");
-    try {
-      const secondaryCoins = await this._pool.query(
+    return withPostgresTransaction(this._pool, async (client) => {
+      // Rare account merges serialize writers on these tables, including legacy
+      // callers that do not participate in application-specific advisory locks.
+      // Reads remain available. Keep the whole transfer on this client.
+      await client.query("LOCK TABLE iap_coin_balances, iap_subscriptions IN SHARE ROW EXCLUSIVE MODE");
+      const secondaryCoins = await client.query(
         `SELECT game_id, balance FROM iap_coin_balances WHERE profile_id = $1`,
         [secondary]
       );
@@ -166,7 +229,7 @@ export class PostgresIapStore {
         if (delta <= 0) {
           continue;
         }
-        await this._pool.query(
+        await client.query(
           `
           INSERT INTO iap_coin_balances (profile_id, game_id, balance, updated_at)
           VALUES ($1, $2, $3, NOW())
@@ -176,26 +239,22 @@ export class PostgresIapStore {
           [primary, row.game_id, delta]
         );
       }
-      await this._pool.query(
+      await client.query(
         `UPDATE iap_coin_balances SET balance = 0, updated_at = NOW() WHERE profile_id = $1`,
         [secondary]
       );
 
-      const primarySub = await this.getSubscription(primary);
-      const secondarySub = await this.getSubscription(secondary);
+      const primarySub = await this._getSubscription(client, primary);
+      const secondarySub = await this._getSubscription(client, secondary);
       const chosen = chooseSubscription(primarySub, secondarySub);
-      await this.upsertSubscription(primary, chosen);
-      await this.upsertSubscription(secondary, {
+      await this._writeSubscription(client, primary, chosen);
+      await this._writeSubscription(client, secondary, {
         active: false,
         status: "merged",
         provider: chosen.provider || ""
       });
-      await this._pool.query("COMMIT");
       return { merged: true };
-    } catch (error) {
-      await this._pool.query("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   async close() {

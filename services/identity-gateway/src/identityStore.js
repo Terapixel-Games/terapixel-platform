@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { withPostgresTransaction } from "../../../packages/shared-utils/index.js";
 
 export class InMemoryIdentityStore {
   constructor() {
@@ -86,7 +87,7 @@ export class InMemoryIdentityStore {
     if (!record) {
       throw new Error("merge code not found");
     }
-    if (record.usedAt) {
+    if (record.usedAt || record.usedBySecondaryProfileId) {
       throw new Error("merge code already used");
     }
     if (record.expiresAt < now) {
@@ -95,6 +96,11 @@ export class InMemoryIdentityStore {
     const primary = await this.resolvePrimaryProfileId(record.primaryProfileId);
     if (primary === secondary) {
       throw new Error("cannot merge an account into itself");
+    }
+    if (!primary || !secondary) throw new Error("invalid merge pair");
+    // Resolving canonical profiles above yields; recheck immediately before use.
+    if (record.usedAt || record.usedBySecondaryProfileId) {
+      throw new Error("merge code already used");
     }
     record.usedAt = now;
     record.usedBySecondaryProfileId = secondary;
@@ -175,17 +181,18 @@ export class InMemoryIdentityStore {
     if (!entry) {
       throw new Error("magic link token not found");
     }
-    if (entry.usedAt) {
+    if (entry.usedAt || entry.usedByProfileId) {
       throw new Error("magic link token already used");
     }
     if (entry.expiresAt < now) {
       throw new Error("magic link token expired");
     }
-    entry.usedAt = now;
-    entry.usedByProfileId = requestedProfileId || normalize(entry.profileId);
-    if (!entry.usedByProfileId) {
+    const usedByProfileId = requestedProfileId || normalize(entry.profileId);
+    if (!usedByProfileId) {
       throw new Error("magic link token missing profile");
     }
+    entry.usedAt = now;
+    entry.usedByProfileId = usedByProfileId;
     this._magicLinks.set(tokenHash, entry);
     return {
       email: entry.email,
@@ -200,8 +207,8 @@ export class InMemoryIdentityStore {
 export class PostgresIdentityStore {
   constructor(options = {}) {
     this._pool = options.pool;
-    if (!this._pool || typeof this._pool.query !== "function") {
-      throw new Error("PostgresIdentityStore requires pool.query");
+    if (!this._pool || typeof this._pool.query !== "function" || typeof this._pool.connect !== "function") {
+      throw new Error("PostgresIdentityStore requires pool.query and pool.connect");
     }
   }
 
@@ -391,11 +398,15 @@ export class PostgresIdentityStore {
   }
 
   async resolvePrimaryProfileId(profileId) {
+    return this._resolvePrimaryProfileId(this._pool, profileId);
+  }
+
+  async _resolvePrimaryProfileId(executor, profileId) {
     let current = normalize(profileId);
     const visited = new Set();
     while (current && !visited.has(current)) {
       visited.add(current);
-      const result = await this._pool.query(
+      const result = await executor.query(
         `SELECT primary_profile_id FROM identity_merges WHERE secondary_profile_id = $1 LIMIT 1`,
         [current]
       );
@@ -434,18 +445,16 @@ export class PostgresIdentityStore {
   }
 
   async redeemMergeCode(secondaryProfileId, code, options = {}) {
-    const secondary = await this.resolvePrimaryProfileId(secondaryProfileId);
     const now = toInt(options.nowSeconds, Math.floor(Date.now() / 1000));
     const codeHash = hashCode(code);
 
-    await this._pool.query("BEGIN");
-    try {
-      const codeRow = await this._pool.query(
+    return withPostgresTransaction(this._pool, async (client) => {
+      const codeRow = await client.query(
         `
         SELECT primary_profile_id, created_at, expires_at, used_at
         FROM identity_merge_codes
         WHERE code_hash = $1
-        LIMIT 1
+        LIMIT 1 FOR UPDATE
       `,
         [codeHash]
       );
@@ -453,23 +462,29 @@ export class PostgresIdentityStore {
       if (!row) {
         throw new Error("merge code not found");
       }
-      if (toInt(row.used_at, 0) > 0) {
+      if (row.used_at !== null && row.used_at !== undefined) {
         throw new Error("merge code already used");
       }
       if (toInt(row.expires_at, 0) < now) {
         throw new Error("merge code expired");
       }
-      const primary = await this.resolvePrimaryProfileId(row.primary_profile_id);
+      // Keep canonical resolution stable against concurrent merge-edge writes.
+      await client.query("LOCK TABLE identity_merges IN SHARE ROW EXCLUSIVE MODE");
+      const secondary = await this._resolvePrimaryProfileId(client, secondaryProfileId);
+      const primary = await this._resolvePrimaryProfileId(client, row.primary_profile_id);
+      if (!primary || !secondary) throw new Error("invalid merge pair");
       if (primary === secondary) {
         throw new Error("cannot merge an account into itself");
       }
-      await this._pool.query(
+      const consumed = await client.query(
         `UPDATE identity_merge_codes
          SET used_at = $2, used_by_secondary_profile_id = $3
-         WHERE code_hash = $1`,
+         WHERE code_hash = $1 AND used_at IS NULL
+         RETURNING code_hash`,
         [codeHash, now, secondary]
       );
-      await this._pool.query(
+      if (consumed.rows.length !== 1) throw new Error("merge code already used");
+      await client.query(
         `
         INSERT INTO identity_merges (secondary_profile_id, primary_profile_id, merged_at)
         VALUES ($1, $2, $3)
@@ -479,16 +494,12 @@ export class PostgresIdentityStore {
       `,
         [secondary, primary, now]
       );
-      await this._pool.query("COMMIT");
       return {
         primaryProfileId: primary,
         secondaryProfileId: secondary,
         mergedAt: now
       };
-    } catch (error) {
-      await this._pool.query("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   async markMerged(primaryProfileId, secondaryProfileId, mergedAt) {
@@ -572,14 +583,13 @@ export class PostgresIdentityStore {
     const requestedProfileId = normalize(profileId);
     const now = toInt(options.nowSeconds, Math.floor(Date.now() / 1000));
     const tokenHash = hashCode(token);
-    await this._pool.query("BEGIN");
-    try {
-      const result = await this._pool.query(
+    return withPostgresTransaction(this._pool, async (client) => {
+      const result = await client.query(
         `
         SELECT email, profile_id, game_id, expires_at, used_at
         FROM identity_magic_links
         WHERE token_hash = $1
-        LIMIT 1
+        LIMIT 1 FOR UPDATE
       `,
         [tokenHash]
       );
@@ -587,7 +597,7 @@ export class PostgresIdentityStore {
       if (!row) {
         throw new Error("magic link token not found");
       }
-      if (toInt(row.used_at, 0) > 0) {
+      if (row.used_at !== null && row.used_at !== undefined) {
         throw new Error("magic link token already used");
       }
       if (toInt(row.expires_at, 0) < now) {
@@ -598,15 +608,16 @@ export class PostgresIdentityStore {
       if (!usedByProfileId) {
         throw new Error("magic link token missing profile");
       }
-      await this._pool.query(
+      const consumed = await client.query(
         `
         UPDATE identity_magic_links
         SET used_at = $2, used_by_profile_id = $3
-        WHERE token_hash = $1
+        WHERE token_hash = $1 AND used_at IS NULL
+        RETURNING token_hash
       `,
         [tokenHash, now, usedByProfileId]
       );
-      await this._pool.query("COMMIT");
+      if (consumed.rows.length !== 1) throw new Error("magic link token already used");
       return {
         email: normalize(row.email),
         profileId: tokenProfileId,
@@ -614,10 +625,7 @@ export class PostgresIdentityStore {
         usedByProfileId,
         usedAt: now
       };
-    } catch (error) {
-      await this._pool.query("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   async close() {

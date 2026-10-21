@@ -60,7 +60,7 @@ export function createIapService(options = {}) {
         gameId: normalizedGameId,
         iapProviderConfigs
       });
-      const dedupe = await store.recordTransaction(
+      const dedupe = await store.applyTransaction(
         normalized.provider,
         normalized.externalTransactionId,
         {
@@ -69,7 +69,10 @@ export function createIapService(options = {}) {
           type: normalized.type,
           productId: normalized.productId,
           normalized
-        }
+        },
+        normalized.type === "consumable"
+          ? { coins: { gameId: normalized.gameId, delta: normalized.coinsDelta } }
+          : { subscription: normalized.subscription }
       );
 
       if (!dedupe.isNew) {
@@ -79,12 +82,6 @@ export function createIapService(options = {}) {
           purchase: normalized,
           entitlements
         };
-      }
-
-      if (normalized.type === "consumable") {
-        await store.addCoins(profileId, normalized.gameId, normalized.coinsDelta);
-      } else if (normalized.subscription) {
-        await store.upsertSubscription(profileId, normalized.subscription);
       }
 
       const entitlements = await getEntitlementsInternal(profileId);
@@ -129,21 +126,21 @@ export function createIapService(options = {}) {
         throw new Error("gameId is required");
       }
       const deltaInt = Math.floor(Number(delta) || 0);
-      if (deltaInt === 0) {
-        throw new Error("delta must be non-zero");
+      if (!Number.isSafeInteger(deltaInt) || deltaInt === 0) {
+        throw new Error("delta must be a finite non-zero integer");
       }
       const dedupeKey = String(idempotencyKey || "").trim();
       if (!dedupeKey) {
         throw new Error("idempotencyKey is required");
       }
 
-      const tx = await store.recordTransaction("internal_coin_adjust", dedupeKey, {
+      const tx = await store.applyTransaction("internal_coin_adjust", dedupeKey, {
         profileId,
         gameId: normalizedGameId,
         type: "coin_adjust",
         reason: String(reason || "").trim(),
         delta: deltaInt
-      });
+      }, { coins: { gameId: normalizedGameId, delta: deltaInt } });
       if (!tx.isNew) {
         const entitlements = await getEntitlementsInternal(profileId);
         return {
@@ -154,14 +151,6 @@ export function createIapService(options = {}) {
         };
       }
 
-      if (deltaInt < 0) {
-        const balances = await store.getCoins(profileId);
-        const current = Number(balances?.[normalizedGameId]?.balance || 0);
-        if (current + deltaInt < 0) {
-          throw new Error("insufficient coins");
-        }
-      }
-      await store.addCoins(profileId, normalizedGameId, deltaInt);
       const entitlements = await getEntitlementsInternal(profileId);
       return {
         deduplicated: false,

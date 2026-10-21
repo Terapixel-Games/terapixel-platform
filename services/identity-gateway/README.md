@@ -170,3 +170,28 @@ not trigger the checked-in deployment workflows. Tag/manual workflows do not
 currently enforce ancestry from main; release operators must select a reviewed
 main revision. No merge, tag, workflow dispatch, deployment, or live configuration
 change is part of this patch.
+
+### Staging replacement: preserve deployed edge ingress
+
+The staging image identified by digest
+`sha256:c872c6454424a39e2b04161812985e2073bfd3c418aad71aac31895f7829d0a6`
+contains an ingress guard absent from repository history. The replacement preserves
+its recovered implementation: when `EDGE_INGRESS_SECRET` is configured,
+`x-terapixel-origin-secret` is required outside health/JWKS and the existing
+`/v1/identity/internal/` exemption. Those internal routes still require their admin
+key. OPTIONS handling and public web/magic-link behavior through the trusted edge
+remain unchanged. Secret comparisons use the recovered constant-time helper.
+No runtime secret values were recovered from the image or added to this repository.
+
+This origin proof is distinct from `x-nakama-exchange-key`: backend exchanges must
+satisfy both existing ingress policy and the dedicated backend proof. Global player
+sessions remain intentional; no consumer game_id rejection is included. Without
+approved exchange-key configuration, Nakama exchange remains fail-closed.
+
+Main pushes no longer trigger the all-service Cloud Run deployment workflow.
+Existing version-tag/manual entrypoints remain; operators must not dispatch that
+workflow for an identity-only release because it deploys every manifest service.
+The scoped staging replacement targets only `terapixel-identity-gateway` in
+`terapixel-platform-staging`, `us-central1`, from reviewed main, using an image-only
+service update preserving existing runtime identity, environment, secret references,
+IAM and ingress settings. Record the old revision/digest before any deployment.

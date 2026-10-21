@@ -2,7 +2,8 @@ name: Cloud Run Deploy
 
 on:
   push:
-    branches: ["main"]
+    # Main is the release source; staging deployments are selected explicitly.
+    # Avoid a gateway merge automatically deploying every manifest service.
     tags: ["v*"]
   workflow_dispatch:
     inputs:
